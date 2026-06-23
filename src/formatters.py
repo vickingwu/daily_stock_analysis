@@ -226,6 +226,165 @@ def markdown_to_html_document(markdown_text: str) -> str:
         """
 
 
+# ---------------------------------------------------------------------------
+# 微信公众号 (WeChat Official Account / MP) 兼容渲染
+# ---------------------------------------------------------------------------
+# 公众号「图文素材」编辑器在粘贴时会重写 HTML：丢弃 <head>/<style>、丢弃 class/id，
+# 只保留每个标签上的行内 style="..."。因此 markdown_to_html_document() 生成的
+# <style> 样式表会全部失效，导致复制到公众号后格式错乱。
+# markdown_to_wechat_mp_html() 把样式全部写成行内 style，并让表格在窄屏自适应换行，
+# 复制到公众号编辑器后可保持排版。
+_WECHAT_MP_STYLES = {
+    "body": (
+        "margin:0;padding:0;"
+        "font-family:-apple-system,BlinkMacSystemFont,'PingFang SC','Helvetica Neue',"
+        "Helvetica,Arial,'Microsoft YaHei',sans-serif;"
+        "font-size:16px;line-height:1.75;color:#3f3f3f;"
+        "word-break:break-word;overflow-wrap:break-word;"
+    ),
+    "h1": (
+        "font-size:21px;line-height:1.4;font-weight:bold;color:#1a1a1a;"
+        "margin:24px 0 16px;padding-bottom:8px;border-bottom:2px solid #2f6fed;"
+    ),
+    "h2": (
+        "font-size:19px;line-height:1.4;font-weight:bold;color:#1a1a1a;"
+        "margin:22px 0 14px;padding-left:10px;border-left:4px solid #2f6fed;"
+    ),
+    "h3": (
+        "font-size:17px;line-height:1.4;font-weight:bold;color:#2f6fed;"
+        "margin:18px 0 10px;"
+    ),
+    "h4": (
+        "font-size:16px;line-height:1.4;font-weight:bold;color:#2f6fed;"
+        "margin:16px 0 8px;"
+    ),
+    "p": "margin:0 0 14px;font-size:16px;line-height:1.75;color:#3f3f3f;",
+    "ul": "margin:0 0 14px;padding-left:22px;",
+    "ol": "margin:0 0 14px;padding-left:22px;",
+    "li": "margin:4px 0;font-size:16px;line-height:1.7;color:#3f3f3f;",
+    "blockquote": (
+        "margin:0 0 14px;padding:10px 14px;color:#666;"
+        "background:#f7f7f7;border-left:4px solid #d0d0d0;border-radius:2px;"
+    ),
+    "hr": "border:none;border-top:1px solid #e6e6e6;margin:20px 0;",
+    "pre": (
+        "margin:0 0 14px;padding:12px;font-size:13px;line-height:1.5;color:#333;"
+        "background:#f6f8fa;border-radius:4px;overflow-x:auto;"
+        "font-family:Consolas,Monaco,'Courier New',monospace;white-space:pre;"
+    ),
+    # 公众号不支持 display:block + overflow-x 的表格滚动，用 100% 宽 + 自动换行兜底
+    "table": (
+        "width:100%;border-collapse:collapse;margin:0 0 16px;"
+        "font-size:14px;line-height:1.6;table-layout:fixed;"
+    ),
+    "th": (
+        "border:1px solid #dfe2e5;padding:8px;text-align:left;"
+        "background:#f2f6ff;font-weight:bold;color:#1a1a1a;word-break:break-word;"
+    ),
+    "td": (
+        "border:1px solid #dfe2e5;padding:8px;text-align:left;color:#3f3f3f;"
+        "word-break:break-word;"
+    ),
+}
+
+_WECHAT_MP_INLINE_STYLES = {
+    "strong": "font-weight:bold;color:#1a1a1a;",
+    "b": "font-weight:bold;color:#1a1a1a;",
+    "em": "font-style:italic;",
+    "code": (
+        "padding:2px 5px;margin:0 2px;font-size:14px;color:#c7254e;"
+        "background:#f9f2f4;border-radius:3px;"
+        "font-family:Consolas,Monaco,'Courier New',monospace;"
+    ),
+    "a": "color:#2f6fed;text-decoration:none;word-break:break-all;",
+}
+
+
+def _wechat_inject_inline_style(html: str, tag: str, style: str) -> str:
+    """给指定标签的开标签注入行内 style（已有 style 的不动，避免重复/覆盖）。"""
+    pattern = re.compile(rf"<{tag}(?![\w-])((?:\s+[^>]*?)?)>", re.IGNORECASE)
+
+    def _repl(match: "re.Match") -> str:
+        attrs = match.group(1) or ""
+        if re.search(r"\bstyle\s*=", attrs, re.IGNORECASE):
+            return match.group(0)
+        # 处理自闭合写法 <hr /> / <br />：剥离结尾的 "/" 再补 style
+        self_closing = attrs.rstrip().endswith("/")
+        if self_closing:
+            attrs = attrs.rstrip()[:-1]
+        suffix = " />" if self_closing else ">"
+        return f"<{tag}{attrs.rstrip()} style=\"{style}\"{suffix}"
+
+    return pattern.sub(_repl, html)
+
+
+def _wechat_zebra_rows(html: str) -> str:
+    """给表格数据行加斑马纹底色（公众号支持行内 background）。"""
+    out: List[str] = []
+    row_index = 0
+    for part in re.split(r"(<tr[^>]*>)", html):
+        if part.lower().startswith("<tr"):
+            row_index += 1
+            if row_index >= 2 and row_index % 2 == 1 and "style=" not in part.lower():
+                part = part[:-1] + ' style="background:#fafbfc;">'
+        out.append(part)
+    return "".join(out)
+
+
+def markdown_to_wechat_mp_html(
+    markdown_text: str,
+    *,
+    full_document: bool = True,
+    container_padding: str = "16px",
+) -> str:
+    """将 Markdown 渲染为微信公众号兼容的、全行内样式 HTML。
+
+    与 :func:`markdown_to_html_document` 的区别：所有样式都写成行内 ``style``，
+    不使用 ``<style>`` 或 ``class``，因此复制到公众号编辑器后排版不会丢失；
+    表格使用 100% 宽 + 自动换行，避免在手机窄屏溢出。
+
+    Args:
+        markdown_text: 原始 Markdown 内容。
+        full_document: True 返回完整 HTML 文档（便于浏览器打开后复制）；
+            False 仅返回 ``<section>`` 片段（便于程序内嵌）。
+        container_padding: 最外层容器内边距。
+
+    Returns:
+        全行内样式的 HTML 字符串。
+    """
+    inner = markdown2.markdown(
+        markdown_text,
+        extras=["tables", "fenced-code-blocks", "break-on-newline", "cuddled-lists"],
+    )
+
+    for tag in ("h1", "h2", "h3", "h4", "p", "ul", "ol", "li",
+                "blockquote", "hr", "pre", "table", "th", "td"):
+        inner = _wechat_inject_inline_style(inner, tag, _WECHAT_MP_STYLES[tag])
+
+    for tag, style in _WECHAT_MP_INLINE_STYLES.items():
+        inner = _wechat_inject_inline_style(inner, tag, style)
+
+    inner = _wechat_zebra_rows(inner)
+
+    container = (
+        f'<section style="{_WECHAT_MP_STYLES["body"]}padding:{container_padding};'
+        f'max-width:100%;box-sizing:border-box;">\n{inner}\n</section>'
+    )
+
+    if not full_document:
+        return container
+
+    return (
+        "<!DOCTYPE html>\n<html>\n<head>\n"
+        '<meta charset="utf-8">\n'
+        '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
+        "</head>\n"
+        '<body style="margin:0;background:#ffffff;">\n'
+        f"{container}\n"
+        "</body>\n</html>\n"
+    )
+
+
 def markdown_to_plain_text(markdown_text: str) -> str:
     """
     将 Markdown 转换为纯文本

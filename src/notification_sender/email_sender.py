@@ -17,7 +17,7 @@ import smtplib
 
 from data_provider.base import normalize_stock_code
 from src.config import Config
-from src.formatters import markdown_to_html_document
+from src.formatters import markdown_to_wechat_mp_html
 
 
 logger = logging.getLogger(__name__)
@@ -165,8 +165,9 @@ class EmailSender:
                 date_str = datetime.now().strftime('%Y-%m-%d')
                 subject = f"📈 股票智能分析报告 - {date_str}"
             
-            # 将 Markdown 转换为简单 HTML
-            html_content = markdown_to_html_document(content)
+            # 将 Markdown 转换为微信公众号兼容的全行内样式 HTML
+            # （行内样式在邮件客户端同样正常显示，且复制到公众号编辑器不丢排版）
+            html_content = markdown_to_wechat_mp_html(content)
             
             # 构建邮件
             msg = MIMEMultipart('alternative')
