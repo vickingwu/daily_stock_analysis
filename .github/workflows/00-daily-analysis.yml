@@ -17,6 +17,11 @@ on:
           - full          # 完整分析（股票+大盘）
           - market-only   # 仅大盘复盘
           - stocks-only   # 仅股票分析
+      stock_list:
+        description: '股票代码（逗号分隔，可输入多个；留空则使用 STOCK_LIST 变量）'
+        required: false
+        default: ''
+        type: string
       force_run:
         description: '强制运行（跳过交易日检查）'
         required: false
@@ -461,13 +466,21 @@ jobs:
             echo "⚡ 已启用强制运行模式（跳过交易日检查）"
           fi
 
+          # 手动指定的股票代码（逗号分隔，可多个），留空则使用 STOCK_LIST 变量
+          STOCKS_ARG=""
+          STOCK_LIST_INPUT="${{ github.event.inputs.stock_list }}"
+          if [ -n "$STOCK_LIST_INPUT" ]; then
+            STOCKS_ARG="--stocks $STOCK_LIST_INPUT"
+            echo "🎯 手动指定股票: $STOCK_LIST_INPUT"
+          fi
+
           # 执行分析
           if [ "$MODE" = "market-only" ]; then
             python main.py --market-review $FORCE_RUN_ARG
           elif [ "$MODE" = "stocks-only" ]; then
-            python main.py --no-market-review $FORCE_RUN_ARG
+            python main.py --no-market-review $STOCKS_ARG $FORCE_RUN_ARG
           else
-            python main.py $FORCE_RUN_ARG
+            python main.py $STOCKS_ARG $FORCE_RUN_ARG
           fi
       
       - name: 上传分析报告
