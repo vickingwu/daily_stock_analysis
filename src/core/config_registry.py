@@ -3019,6 +3019,35 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         ],
         "warning_codes": [],
     },
+    "MARKET_SECTOR_REASON_ENABLED": {
+        "title": "Market Sector Driver Reason",
+        "description": (
+            "Use the LLM and the day's market news to explain why each leading/lagging sector moved. "
+            "When disabled, the driver column falls back to sector internals (advancers/decliners and the leading stock)."
+        ),
+        "category": "system",
+        "data_type": "boolean",
+        "ui_control": "switch",
+        "is_sensitive": False,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": "true",
+        "options": [],
+        "validation": {},
+        "display_order": 53,
+        "help_key": "settings.system.market_review",
+        "examples": [
+            "MARKET_SECTOR_REASON_ENABLED=true",
+            "MARKET_SECTOR_REASON_ENABLED=false",
+        ],
+        "docs": [
+            {
+                "label": "完整指南：环境变量完整列表",
+                "href": "https://github.com/ZhuLinsen/daily_stock_analysis/blob/main/docs/full-guide.md#环境变量完整列表",
+            },
+        ],
+        "warning_codes": [],
+    },
     "MARKET_REVIEW_REGION": {
         "title": "Market Review Region",
         "description": "Market region for review: cn (A-shares), hk (Hong Kong), us (US stocks), or both (all markets).",

@@ -65,6 +65,27 @@ _AKSHARE_HISTORY_CALL_TIMEOUT = 30.0
 _AKSHARE_TIMEOUT_PROCESS_JOIN_GRACE = 1.0
 _AKSHARE_TIMEOUT_PROCESS_START_METHOD = "spawn"
 
+# 板块榜单可选的「板块内部结构」列：板块榜单接口本身就返回这些字段，
+# 透传后用于生成板块异动原因，无需额外请求。缺列时自动跳过，保持 name/change_pct 契约不变。
+_SECTOR_INTERNAL_COLUMNS_EM = {
+    'up_count': '上涨家数',
+    'down_count': '下跌家数',
+    'leader_stock': '领涨股票',
+    'leader_change_pct': '领涨股票-涨跌幅',
+}
+_SECTOR_INTERNAL_COLUMNS_SINA = {
+    'member_count': '公司家数',
+    'leader_stock': '股票名称',
+    'leader_change_pct': '个股-涨跌幅',
+}
+_SECTOR_INTERNAL_FIELD_TYPES = {
+    'up_count': int,
+    'down_count': int,
+    'member_count': int,
+    'leader_change_pct': float,
+    'leader_stock': str,
+}
+
 
 # User-Agent 池，用于随机轮换
 USER_AGENTS = [
@@ -1917,27 +1938,62 @@ class AkshareFetcher(BaseFetcher):
         数据源优先级：
         1. 东财接口 (ak.stock_board_industry_name_em)
         2. 新浪接口 (ak.stock_sector_spot)
+
+        每个板块除 name / change_pct 外，会按数据源可用情况附带板块内部结构字段
+        （up_count / down_count / member_count / leader_stock / leader_change_pct），
+        供大盘复盘生成板块异动原因；字段缺失时自动省略。
         """
         import akshare as ak
 
-        def _get_rank_top_n(df: pd.DataFrame, change_col: str, industry_name: str, n: int) -> Tuple[list, list]:
+        def _get_rank_top_n(
+            df: pd.DataFrame,
+            change_col: str,
+            industry_name: str,
+            n: int,
+            extra_cols: Optional[Dict[str, str]] = None,
+        ) -> Tuple[list, list]:
             df[change_col] = pd.to_numeric(df[change_col], errors='coerce')
             df = df.dropna(subset=[change_col])
 
             # 涨幅前n
             top = df.nlargest(n, change_col)
             top_sectors = [
-                {'name': row[industry_name], 'change_pct': row[change_col]}
+                _build_sector_item(row, industry_name, change_col, extra_cols)
                 for _, row in top.iterrows()
             ]
 
             bottom = df.nsmallest(n, change_col)
             bottom_sectors = [
-                {'name': row[industry_name], 'change_pct': row[change_col]}
+                _build_sector_item(row, industry_name, change_col, extra_cols)
                 for _, row in bottom.iterrows()
             ]
             return top_sectors, bottom_sectors
-        
+
+        def _build_sector_item(
+            row: pd.Series,
+            name_col: str,
+            change_col: str,
+            extra_cols: Optional[Dict[str, str]],
+        ) -> Dict[str, Any]:
+            item: Dict[str, Any] = {'name': row[name_col], 'change_pct': row[change_col]}
+            for out_key, src_col in (extra_cols or {}).items():
+                if src_col not in row.index:
+                    continue
+                value = row[src_col]
+                if value is None or pd.isna(value):
+                    continue
+                caster = _SECTOR_INTERNAL_FIELD_TYPES.get(out_key, str)
+                try:
+                    casted = caster(value)
+                except (TypeError, ValueError):
+                    continue
+                if caster is str:
+                    casted = casted.strip()
+                    if not casted:
+                        continue
+                item[out_key] = casted
+            return item
+
         # 优先东财接口
         try:
             self._set_random_user_agent()
@@ -1948,7 +2004,7 @@ class AkshareFetcher(BaseFetcher):
             if df is not None and not df.empty:
                 change_col = '涨跌幅'
                 name = '板块名称'
-                return _get_rank_top_n(df, change_col, name, n)
+                return _get_rank_top_n(df, change_col, name, n, _SECTOR_INTERNAL_COLUMNS_EM)
             
         except Exception as e:
             logger.warning(f"[Akshare] 东财接口获取行业板块排行失败: {e}，尝试新浪接口")
@@ -1964,7 +2020,7 @@ class AkshareFetcher(BaseFetcher):
                 return None
             change_col = '涨跌幅'
             name = '板块'
-            return _get_rank_top_n(df, change_col, name, n)
+            return _get_rank_top_n(df, change_col, name, n, _SECTOR_INTERNAL_COLUMNS_SINA)
         
         except Exception as e:
             logger.error(f"[Akshare] 新浪接口获取板块排行也失败: {e}")

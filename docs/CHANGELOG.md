@@ -36,6 +36,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [文档] 补充 AlphaSift 迁移与回退边界：明确 `ALPHASIFT_INSTALL_SPEC` 显式覆盖语义、`requirements.txt + DEFAULT_ALPHASIFT_INSTALL_SPEC` 与运行时兼容边界、以及回滚路径（关闭功能/完整 revert）说明，覆盖旧 pin 用户升级行为。
 
 - [新功能] 个股分析历史成功保存后会从最终报告 best-effort 提取 `DecisionSignal` 决策信号，复用现有信号去重、计划质量计算和脱敏契约。
+- [新功能] 大盘复盘的领涨/领跌板块表格新增「异动原因」列：优先用一次小额 LLM 调用结合当日市场新闻归纳驱动因素，未配置模型、无可用新闻或调用失败时降级为板块内部结构（涨跌家数、领涨个股）描述，两者都拿不到时显示 `-`；新增 `MARKET_SECTOR_REASON_ENABLED` 开关，`market_review_payload.sectors` 追加可选 `reason` / `reason_source` 字段，`name` / `change_pct` 契约不变。
+- [改进] AkShare 板块涨跌榜透传板块榜单接口自带的板块内部结构（东财 `上涨家数`/`下跌家数`/`领涨股票`/`领涨股票-涨跌幅`，新浪 `公司家数`/`股票名称`/`个股-涨跌幅`），不额外发起请求，缺列时自动省略字段。
 
 ## [3.22.0] - 2026-06-13
 

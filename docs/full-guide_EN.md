@@ -346,6 +346,7 @@ For the notification baseline, diagnostics, and deployment notes, see [Notificat
 | `MAX_WORKERS` | Concurrent threads | `3` |
 | `MARKET_REVIEW_ENABLED` | Enable market review | `true` |
 | `DAILY_MARKET_CONTEXT_ENABLED` | Inject the daily market context into stock-analysis prompts and soften aggressive buy advice in high-risk/risk-off markets; enabled by default, and market review can still run when this is set to `false` | `true` |
+| `MARKET_SECTOR_REASON_ENABLED` | Let the LLM explain the sector Top tables' driver column using the day's market news (one small extra LLM call per review). When set to `false` the driver column still renders, but only from board internals (advancers/decliners and the leading stock) | `true` |
 | `MARKET_REVIEW_REGION` | Market review region: cn (A-shares), hk (HK stocks), us (US stocks), both (all three markets) | `cn` |
 | `MARKET_REVIEW_COLOR_SCHEME` | Index change color style in market reviews: `green_up` = green gains/red losses (default), `red_up` = red gains/green losses | `green_up` |
 | `SCHEDULE_ENABLED` | Enable scheduled tasks | `false` |
@@ -362,6 +363,11 @@ For the notification baseline, diagnostics, and deployment notes, see [Notificat
 > - TickFlow currently returns `change_pct` / `amplitude` as ratio values; this integration normalizes them to the project's percent convention so they match AkShare / Tushare / efinance semantics.
 > - In scheduler mode, if runtime env explicitly sets `RUN_IMMEDIATELY` but does not set `SCHEDULE_RUN_IMMEDIATELY`, the scheduler keeps inheriting the legacy runtime override instead of being pulled back to a persisted `.env` alias value.
 > - CN market review reports now use a post-market workstation layout with market signal, index detail, sector Top tables, news catalysts, next-session plan, and risk sections. The market signal uses a plain-text score such as `66/100 (constructive, risk-on)` instead of block bars so it renders consistently across terminals and notification clients. News catalysts list only headline, source, and link instead of search snippets to reduce mixed-language noise. Missing data sources degrade by omitting or simplifying only the affected block.
+> - Sector Top tables (leading / lagging) have four columns: `Rank | Sector | Change | Driver`. The driver cell falls back through two layers and renders `-` when neither is available; it is capped at ~30 characters (~64 for English reports) and escapes `|`:
+>   1. Interpretation layer (when `MARKET_SECTOR_REASON_ENABLED=true`, an LLM is configured, and news was retrieved that day): one small LLM call summarizes the day's news plus sector clues into a single driver phrase. Sectors the model cannot ground in the provided news are left blank and degrade to the next layer.
+>   2. Factual layer: uses only the board internals already returned by the sector ranking interface, with no extra requests, e.g. `35 up / 0 down, broad advance; led by Yunmei Energy +10.12%`. Lagging rows say `best performer` rather than `led by` so the strongest constituent is not misread as sector strength.
+>   - Board internals come from East Money `stock_board_industry_name_em` (`上涨家数` / `下跌家数` / `领涨股票` / `领涨股票-涨跌幅`). The Sina fallback `stock_sector_spot` only provides `公司家数` / `股票名称` / `个股-涨跌幅`; missing columns are simply omitted.
+>   - `market_review_payload.sectors.{top,bottom}[]` gains optional `reason` and `reason_source` (`llm` / `board_internals`) fields. `name` / `change_pct` are unchanged — fields are only appended.
 > - Per-stock analysis, realtime quote priority, and sector rankings fallback remain unchanged.
 
 ---

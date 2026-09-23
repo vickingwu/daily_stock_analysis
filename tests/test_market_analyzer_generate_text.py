@@ -1050,7 +1050,7 @@ class TestMarketAnalyzerBypassFix:
             limit_up_count=88,
             limit_down_count=5,
             total_amount=14567.0,
-            top_sectors=[{"name": "AI算力", "change_pct": 3.25}],
+            top_sectors=[{"name": "AI算力", "change_pct": 3.25, "reason": "AI capex upgrade cycle"}],
             bottom_sectors=[{"name": "煤炭", "change_pct": -1.12}],
         )
         review = """## 2026-03-05 A-share Market Recap
@@ -1072,9 +1072,11 @@ Sector text.
         assert "Turnover 14567 (CNY 100m)" in result
         assert "| Index | Last | Change % | Open | High | Low | Amplitude | Turnover (CNY 100m) |" in result
         assert "#### Leading Sectors" in result
-        assert "| 1 | AI算力 | +3.25% |" in result
+        assert "| Rank | Sector | Change | Driver |" in result
+        assert "| 1 | AI算力 | +3.25% | AI capex upgrade cycle |" in result
         assert "#### Lagging Sectors" in result
-        assert "| 1 | 煤炭 | -1.12% |" in result
+        # 没有异动原因时占位为 '-'，保证表格列数稳定
+        assert "| 1 | 煤炭 | -1.12% | - |" in result
 
     def test_inject_data_into_review_matches_reference_style_chinese_headings(self):
         from src.market_analyzer import MarketOverview, MarketIndex
@@ -1102,8 +1104,8 @@ Sector text.
             limit_up_count=88,
             limit_down_count=5,
             total_amount=14567.0,
-            top_sectors=[{"name": "AI算力", "change_pct": 3.25}],
-            bottom_sectors=[{"name": "煤炭", "change_pct": -1.12}],
+            top_sectors=[{"name": "AI算力", "change_pct": 3.25, "reason": "算力需求超预期"}],
+            bottom_sectors=[{"name": "煤炭", "change_pct": -1.12, "reason": "3涨45跌，板块普跌"}],
         )
         news = [{"title": "AI算力板块走强", "snippet": "算力产业链延续活跃，成交额放大"}]
         review = """## 2026-03-05 大盘复盘
@@ -1142,7 +1144,9 @@ Sector text.
         assert "| 指数 | 最新 | 涨跌幅 | 开盘 | 最高 | 最低 | 振幅 | 成交额(亿) |" in result
         assert "| 上证指数 | 3300.00 | 🟢 +0.36% | 3288.00 | 3312.00 | 3276.00 | 1.10% | 1450 |" in result
         assert "#### 领涨板块 Top 5" in result
-        assert "| 1 | AI算力 | +3.25% |" in result
+        assert "| 排名 | 板块 | 涨跌幅 | 异动原因 |" in result
+        assert "| 1 | AI算力 | +3.25% | 算力需求超预期 |" in result
+        assert "| 1 | 煤炭 | -1.12% | 3涨45跌，板块普跌 |" in result
         assert "#### 近三日市场线索" not in result
         assert "AI算力板块走强" not in result
         assert "新闻。" in result

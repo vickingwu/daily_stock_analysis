@@ -26,6 +26,7 @@ from src.core.market_profile import get_profile, MarketProfile
 from src.core.market_strategy import get_market_strategy_blueprint
 from src.schemas.market_light import MarketLightSnapshot
 from src.services.run_diagnostics import record_llm_run, record_llm_run_started
+from src.services.sector_driver_service import SectorDriverService
 from data_provider.base import DataFetcherManager
 
 logger = logging.getLogger(__name__)
@@ -43,6 +44,18 @@ _CHINESE_SECTION_PATTERNS = {
     "sector_highlights": r"###\s*三、(?:板块主线|热点解读|板块表现)",
     "funds_sentiment": r"###\s*四、(?:资金与情绪|资金动向)",
     "news_catalysts": r"###\s*五、(?:消息催化|后市展望)",
+}
+
+# 板块涨跌榜表头（含异动原因列），(表头行, 分隔行)
+_SECTOR_TABLE_HEADERS = {
+    "en": (
+        "| Rank | Sector | Change | Driver |",
+        "|------|--------|--------|--------|",
+    ),
+    "zh": (
+        "| 排名 | 板块 | 涨跌幅 | 异动原因 |",
+        "|------|------|--------|----------|",
+    ),
 }
 
 
@@ -447,6 +460,34 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
 
         except Exception as e:
             logger.error("[大盘] %s action=get_sector_rankings status=failed error=%s", self._log_context(), e)
+
+    def _annotate_sector_reasons(self, overview: MarketOverview, news: List) -> None:
+        """为领涨/领跌板块补充异动原因（失败只降级为空原因，不影响复盘主流程）"""
+        if not self.profile.has_sector_rankings:
+            return
+        if not overview.top_sectors and not overview.bottom_sectors:
+            return
+
+        try:
+            logger.info("[大盘] %s action=annotate_sector_reasons status=start", self._log_context())
+            stats = SectorDriverService(config=self.config, analyzer=self.analyzer).annotate(
+                overview.top_sectors,
+                overview.bottom_sectors,
+                news=news,
+                language=self._get_review_language(),
+            )
+            logger.info(
+                "[大盘] %s action=annotate_sector_reasons status=success total=%s llm=%s factual=%s empty=%s",
+                self._log_context(),
+                stats.get("total"),
+                stats.get("llm"),
+                stats.get("factual"),
+                stats.get("empty"),
+            )
+        except Exception as e:
+            logger.warning(
+                "[大盘] %s action=annotate_sector_reasons status=failed error=%s", self._log_context(), e
+            )
     
     # def _get_north_flow(self, overview: MarketOverview):
     #     """获取北向资金流入"""
@@ -936,44 +977,47 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
         """Build sector ranking block."""
         if not overview.top_sectors and not overview.bottom_sectors:
             return ""
+        language = self._get_review_language()
+        header, divider = _SECTOR_TABLE_HEADERS["en" if language == "en" else "zh"]
         lines = []
         if overview.top_sectors:
-            if self._get_review_language() == "en":
-                lines.extend([
-                    "#### Leading Sectors",
-                    "| Rank | Sector | Change |",
-                    "|------|--------|--------|",
-                ])
-            else:
-                lines.extend([
-                    "#### 领涨板块 Top 5",
-                    "| 排名 | 板块 | 涨跌幅 |",
-                    "|------|------|--------|",
-                ])
-            for rank, sector in enumerate(overview.top_sectors[:5], 1):
-                lines.append(
-                    f"| {rank} | {sector.get('name', '-')} | {self._format_signed_pct(sector.get('change_pct'))} |"
-                )
+            lines.append("#### Leading Sectors" if language == "en" else "#### 领涨板块 Top 5")
+            lines.extend([header, divider])
+            lines.extend(self._build_sector_rows(overview.top_sectors))
         if overview.bottom_sectors:
             if lines:
                 lines.append("")
-            if self._get_review_language() == "en":
-                lines.extend([
-                    "#### Lagging Sectors",
-                    "| Rank | Sector | Change |",
-                    "|------|--------|--------|",
-                ])
-            else:
-                lines.extend([
-                    "#### 领跌板块 Top 5",
-                    "| 排名 | 板块 | 涨跌幅 |",
-                    "|------|------|--------|",
-                ])
-            for rank, sector in enumerate(overview.bottom_sectors[:5], 1):
-                lines.append(
-                    f"| {rank} | {sector.get('name', '-')} | {self._format_signed_pct(sector.get('change_pct'))} |"
-                )
+            lines.append("#### Lagging Sectors" if language == "en" else "#### 领跌板块 Top 5")
+            lines.extend([header, divider])
+            lines.extend(self._build_sector_rows(overview.bottom_sectors))
         return "\n".join(lines)
+
+    @classmethod
+    def _build_sector_rows(cls, sectors: List[Dict]) -> List[str]:
+        """Render sector table rows, including the driver (异动原因) column."""
+        return [
+            f"| {rank} | {sector.get('name', '-')} | {cls._format_signed_pct(sector.get('change_pct'))} "
+            f"| {cls._format_sector_reason(sector.get('reason'))} |"
+            for rank, sector in enumerate(sectors[:5], 1)
+        ]
+
+    @staticmethod
+    def _format_sector_reason(value: Any) -> str:
+        """Collapse the driver text to one table-safe cell; '-' when unavailable."""
+        text = " ".join(str(value or "").split()).replace("|", "/")
+        return text or "-"
+
+    @classmethod
+    def _format_prompt_sectors(cls, sectors: List[Dict], limit: int = 3) -> str:
+        """Format sectors for the review prompt, appending the driver when known."""
+        parts = []
+        for sector in (sectors or [])[:limit]:
+            text = f"{sector.get('name', '-')}({cls._format_signed_pct(sector.get('change_pct'))})"
+            reason = " ".join(str(sector.get("reason") or "").split())
+            if reason:
+                text = f"{text}[{reason}]"
+            parts.append(text)
+        return ", ".join(parts)
 
     def _build_news_block(self, news: List) -> str:
         """Build a compact source-aware news catalyst list for the rendered report."""
@@ -1134,9 +1178,9 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
             direction = "↑" if idx.change_pct > 0 else "↓" if idx.change_pct < 0 else "-"
             indices_text += f"- {idx.name}: {idx.current:.2f} ({direction}{abs(idx.change_pct):.2f}%)\n"
         
-        # 板块信息
-        top_sectors_text = ", ".join([f"{s['name']}({s['change_pct']:+.2f}%)" for s in overview.top_sectors[:3]])
-        bottom_sectors_text = ", ".join([f"{s['name']}({s['change_pct']:+.2f}%)" for s in overview.bottom_sectors[:3]])
+        # 板块信息（带异动原因，保证正文解读与板块表格一致）
+        top_sectors_text = self._format_prompt_sectors(overview.top_sectors)
+        bottom_sectors_text = self._format_prompt_sectors(overview.bottom_sectors)
         
         # 新闻信息 - 支持 SearchResult 对象或字典
         news_text = ""
@@ -1454,6 +1498,9 @@ Market conditions can change quickly. The data above is for reference only and d
 
         # 2. 搜索市场新闻
         news = self.search_market_news()
+
+        # 2.5 结合新闻与板块内部结构，补充板块异动原因（供表格与 Prompt 共用）
+        self._annotate_sector_reasons(overview, news)
 
         # 3. 生成复盘报告
         report = self.generate_market_review(overview, news)
