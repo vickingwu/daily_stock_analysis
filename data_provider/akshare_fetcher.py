@@ -78,6 +78,23 @@ _SECTOR_INTERNAL_COLUMNS_SW_L1 = {
 }
 
 
+# 板块新闻里的低价值噪声：龙虎榜/机构调研明细等 AI 批量生成稿，内容只是涨跌幅复述，
+# 对「为什么异动」没有信息量，喂给模型反而会诱导它复述行情
+_LOW_VALUE_NEWS_TITLE_TOKENS = (
+    '龙虎榜', '大宗交易', '融资融券余额', '股东户数', '每日互动',
+    # 数据宝式榜单稿：正文只是把涨跌幅重新罗列一遍，没有「为什么」
+    '附股', '低价股一览', '盘中播报', '行业涨幅最大', '行业跌幅最大',
+    '涨停股一览', '一览表', '业绩预告一览',
+)
+_LOW_VALUE_NEWS_CONTENT_TOKENS = ('本文基于AI生产', '本文基于 AI 生产')
+
+
+def _is_low_value_sector_news(title: str, content: str) -> bool:
+    if any(token in title for token in _LOW_VALUE_NEWS_TITLE_TOKENS):
+        return True
+    return any(token in content for token in _LOW_VALUE_NEWS_CONTENT_TOKENS)
+
+
 def _safe_float_or_none(value: Any) -> Optional[float]:
     try:
         if value is None or pd.isna(value):
@@ -2286,6 +2303,97 @@ class AkshareFetcher(BaseFetcher):
                     ]
 
         return result
+
+    def get_sector_news(
+        self,
+        sector_names: List[str],
+        *,
+        max_items: int = 5,
+    ) -> Dict[str, List[Dict[str, str]]]:
+        """按行业名检索板块新闻（东财，无需任何 API Key）。
+
+        东财新闻接口接受任意关键词，传行业名即可拿到当日板块级报道，内容通常已包含
+        「板块+龙头股+跟涨股+消息面」，正是行业异动原因需要的素材。这是通用网页搜索
+        未配置时的主要催化来源。
+
+        Args:
+            sector_names: 行业名列表
+            max_items: 每个行业保留的新闻条数
+
+        Returns:
+            Dict: ``{行业名: [{title, snippet, source, published_date}]}``；
+            单个行业失败只影响该行业，不抛异常。
+        """
+        import akshare as ak
+
+        result: Dict[str, List[Dict[str, str]]] = {}
+        for raw_name in sector_names or []:
+            name = str(raw_name or '').strip()
+            if not name or name in result:
+                continue
+            try:
+                self._set_random_user_agent()
+                self._enforce_rate_limit()
+                logger.info(f"[API调用] ak.stock_news_em(symbol={name}) 获取板块新闻...")
+                df = ak.stock_news_em(symbol=name)
+            except Exception as e:
+                logger.warning(f"[Akshare] 行业 {name} 新闻获取失败: {e}")
+                continue
+
+            if df is None or df.empty or '新闻标题' not in df.columns:
+                continue
+
+            items: List[Dict[str, str]] = []
+            for _, row in df.iterrows():
+                title = str(row.get('新闻标题') or '').strip()
+                content = str(row.get('新闻内容') or '').strip()
+                if not title or _is_low_value_sector_news(title, content):
+                    continue
+                items.append({
+                    'title': title,
+                    'snippet': content,
+                    'source': str(row.get('文章来源') or '').strip(),
+                    'published_date': str(row.get('发布时间') or '').strip(),
+                })
+                if len(items) >= max_items:
+                    break
+            if items:
+                result[name] = items
+
+        logger.info(f"[Akshare] 板块新闻获取完成: {len(result)}/{len(sector_names or [])} 个行业有结果")
+        return result
+
+    def get_market_wire_news(self, limit: int = 10) -> List[Dict[str, str]]:
+        """获取财联社电报（无需 API Key），作为市场级消息面来源。"""
+        import akshare as ak
+
+        try:
+            self._set_random_user_agent()
+            self._enforce_rate_limit()
+            logger.info("[API调用] ak.stock_info_global_cls() 获取财联社电报...")
+            df = ak.stock_info_global_cls(symbol='全部')
+        except Exception as e:
+            logger.warning(f"[Akshare] 财联社电报获取失败: {e}")
+            return []
+
+        if df is None or df.empty or '标题' not in df.columns:
+            return []
+
+        items: List[Dict[str, str]] = []
+        for _, row in df.iterrows():
+            title = str(row.get('标题') or '').strip()
+            content = str(row.get('内容') or '').strip()
+            if not title and not content:
+                continue
+            items.append({
+                'title': title or content[:60],
+                'snippet': content,
+                'source': '财联社',
+                'published_date': f"{row.get('发布日期', '')} {row.get('发布时间', '')}".strip(),
+            })
+            if len(items) >= limit:
+                break
+        return items
 
     def get_concept_rankings(self, n: int = 5) -> Optional[Tuple[List[Dict], List[Dict]]]:
         """获取概念/题材涨跌榜。"""

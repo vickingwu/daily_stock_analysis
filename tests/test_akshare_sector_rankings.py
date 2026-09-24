@@ -269,3 +269,87 @@ class TestSectorCatalystContext(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestSectorNewsSources(unittest.TestCase):
+    """东财板块新闻 / 财联社电报：通用搜索未配置时的催化来源，无需任何 API Key。"""
+
+    def setUp(self):
+        self.fetcher = AkshareFetcher()
+        self.fetcher._enforce_rate_limit = lambda: None
+        self.fetcher._set_random_user_agent = lambda: None
+
+    @staticmethod
+    def _news_df():
+        return pd.DataFrame([
+            {'新闻标题': '煤炭采选板块震荡反弹 云煤能源直线涨停',
+             '新闻内容': '消息面上，生意社动力煤基准价989.50元/吨，较本月初上涨13.02%。',
+             '发布时间': '2026-09-24 09:41:48', '文章来源': '东方财富Choice数据'},
+            # 以下四条都是纯涨跌幅复述的榜单稿，必须被过滤
+            {'新闻标题': '云煤能源600792龙虎榜数据09-22', '新闻内容': '当日收报5.75元，涨跌幅5.31%。',
+             '发布时间': '2026-09-22 16:58:52', '文章来源': '东方财富Choice数据'},
+            {'新闻标题': '39只股上午收盘涨停(附股)', '新闻内容': '601567 三星电气 16.25 ...',
+             '发布时间': '2026-09-24 11:35:00', '文章来源': '证券时报网'},
+            {'新闻标题': '今日沪指跌0.93% 有色金属行业跌幅最大', '新闻内容': '从申万行业来看...',
+             '发布时间': '2026-09-24 13:14:00', '文章来源': '证券时报网'},
+            {'新闻标题': '某公司公告', '新闻内容': '本文基于AI生产，仅供参考',
+             '发布时间': '2026-09-24 10:00:00', '文章来源': 'AI'},
+            {'新闻标题': '煤炭保供贵在安全主动', '新闻内容': '在关键时间窗口发力稳煤保供。',
+             '发布时间': '2026-09-24 07:57:40', '文章来源': '经济日报'},
+        ])
+
+    def test_fetches_news_by_industry_name_and_filters_noise(self):
+        with patch('akshare.stock_news_em', return_value=self._news_df()) as m:
+            result = self.fetcher.get_sector_news(['煤炭'], max_items=5)
+
+        m.assert_called_once_with(symbol='煤炭')
+        titles = [item['title'] for item in result['煤炭']]
+        self.assertEqual(titles, ['煤炭采选板块震荡反弹 云煤能源直线涨停', '煤炭保供贵在安全主动'])
+        self.assertIn('13.02%', result['煤炭'][0]['snippet'])
+        self.assertEqual(result['煤炭'][0]['source'], '东方财富Choice数据')
+
+    def test_respects_max_items_and_dedupes_names(self):
+        with patch('akshare.stock_news_em', return_value=self._news_df()) as m:
+            result = self.fetcher.get_sector_news(['煤炭', '煤炭', ''], max_items=1)
+
+        self.assertEqual(m.call_count, 1)
+        self.assertEqual(len(result['煤炭']), 1)
+
+    def test_isolates_per_industry_failure(self):
+        def side_effect(symbol):
+            if symbol == '煤炭':
+                raise RuntimeError('news down')
+            return self._news_df()
+
+        with patch('akshare.stock_news_em', side_effect=side_effect):
+            result = self.fetcher.get_sector_news(['煤炭', '银行'])
+
+        self.assertNotIn('煤炭', result)
+        self.assertIn('银行', result)
+
+    def test_returns_empty_when_all_news_filtered(self):
+        df = self._news_df().iloc[[1, 2, 3, 4]]  # 全是噪声行
+
+        with patch('akshare.stock_news_em', return_value=df):
+            self.assertEqual(self.fetcher.get_sector_news(['煤炭']), {})
+
+    def test_market_wire_news(self):
+        df = pd.DataFrame([
+            {'标题': '高盛：预计美联储10月完成最后一次加息', '内容': '财联社9月24日电，高盛在最新报告中...',
+             '发布日期': '2026-09-24', '发布时间': '12:30:00'},
+            {'标题': '', '内容': '台交所加权股价指数收低0.3%报48,024.60点。',
+             '发布日期': '2026-09-24', '发布时间': '13:40:00'},
+        ])
+
+        with patch('akshare.stock_info_global_cls', return_value=df) as m:
+            items = self.fetcher.get_market_wire_news(limit=5)
+
+        m.assert_called_once_with(symbol='全部')
+        self.assertEqual(items[0]['source'], '财联社')
+        self.assertEqual(items[0]['published_date'], '2026-09-24 12:30:00')
+        # 无标题时用正文开头兜底，避免整条丢失
+        self.assertTrue(items[1]['title'].startswith('台交所'))
+
+    def test_market_wire_news_survives_failure(self):
+        with patch('akshare.stock_info_global_cls', side_effect=RuntimeError('cls down')):
+            self.assertEqual(self.fetcher.get_market_wire_news(), [])

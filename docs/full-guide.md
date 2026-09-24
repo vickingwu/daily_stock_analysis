@@ -401,7 +401,11 @@ daily_stock_analysis/
 >     1. **解读层**（`MARKET_SECTOR_REASON_ENABLED=true`、已配置模型、且检索到新闻时）：一次 LLM 调用，把按行业检索的新闻与行业结构材料归纳成催化说明，例如「发改委部署能源保供叠加长协价机制优化，焦炭Ⅱ子板块领涨，港口库存降至近三年低位」。Prompt 明确禁止只复述涨跌幅或涨跌家数，并要求无依据时弃权。
 >     2. **归因层**：模型弃权或不可用时，只做子板块归因，例如「主要由玻璃玻纤(-3.18%)拖累；未检索到明确消息催化」。这与券商复盘里「主要是航运港口板块走弱」同类，属于对「为什么」的回答；不使用涨跌家数、龙头股涨跌幅这类与原因无关的描述。
 >   - 催化材料来源（申万口径下才采集，全部 fail-open）：申万二级子板块涨跌（归属取 `sw_index_second_info()` 的「上级行业」列，不按代码前缀猜测）、涨停池 `stock_zt_pool_em` 交叉行业成分股 `index_component_sw` 得到的涨停个股（含连板数与子行业）、全市场行情交叉成分股得到的领涨/领跌个股。全市场行情复用已有 20 分钟缓存，东财失败时降级新浪。
->   - 按行业检索新闻由 `MARKET_SECTOR_NEWS_SEARCH_ENABLED` 控制（默认开启），每个展示的行业消耗一次搜索调用（默认 3+3=6 次）；市场级查询覆盖不到单个行业，关闭后原因通常只剩归因层。
+>   - 按行业取新闻由 `MARKET_SECTOR_NEWS_SEARCH_ENABLED` 控制（默认开启），两条来源依次尝试：
+>     1. 通用网页搜索（配置了 Bocha / Tavily / SerpAPI / MiniMax / Brave / SearXNG 任一 Key 时），每个行业一次调用；
+>     2. **东财板块新闻 `stock_news_em`（无需任何 API Key）**，给上一步未命中的行业兜底。该接口接受任意关键词，传行业名即可拿到当日板块级报道，内容通常已含「板块+龙头股+跟涨股+消息面」，例如「煤炭采选板块震荡反弹，云煤能源直线涨停…生意社动力煤基准价 989.50 元/吨，较本月初上涨 13.02%」。
+>   - 未配置任何搜索 provider 是常见部署形态，此时第 2 条是唯一来源；市场级消息面同样会用**财联社电报 `stock_info_global_cls`** 兜底。
+>   - 板块新闻会过滤纯涨跌幅复述的榜单稿（龙虎榜、`附股`、`低价股一览`、`盘中播报`、`行业涨跌幅最大`、AI 批量生成稿等），避免诱导模型复述行情。
 >   - 结构化载荷 `market_review_payload.sectors.{top,bottom}[]` 相应新增可选字段 `reason`、`reason_source`（`llm` / `sub_sector_attribution`）、`taxonomy`（`sw_l1` / `em_l2` / `sina`）与 `code`，`name` / `change_pct` 契约不变，仅追加字段。
 > - 字段契约：
 >   - `fundamental_context.belong_boards` = 个股关联板块列表；A 股从 AkShare 板块名单写入，美股/港股从 yfinance `info.sector` / `info.industry` 写入，无数据时为 `[]`；

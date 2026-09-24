@@ -3450,6 +3450,38 @@ class DataFetcherManager:
             logger.warning(f"[行业归因] 所有数据源均未返回材料，最终错误: {last_error}")
         return {}
 
+    def get_sector_news(self, sector_names: List[str], **kwargs: Any) -> Dict[str, List[Dict[str, str]]]:
+        """按行业名获取板块新闻（可选能力）。全部失败返回空字典。"""
+        if not sector_names:
+            return {}
+        for fetcher in self._fetchers:
+            if not hasattr(fetcher, 'get_sector_news'):
+                continue
+            try:
+                data = fetcher.get_sector_news(sector_names, **kwargs)
+                if data:
+                    logger.info(f"[{fetcher.name}] 获取板块新闻成功: {len(data)} 个行业")
+                    return data
+            except Exception as e:
+                _error_type, error_reason = summarize_exception(e)
+                logger.warning(f"[{fetcher.name}] 获取板块新闻失败: {error_reason}")
+        return {}
+
+    def get_market_wire_news(self, limit: int = 10) -> List[Dict[str, str]]:
+        """获取市场级快讯/电报（可选能力）。全部失败返回空列表。"""
+        for fetcher in self._fetchers:
+            if not hasattr(fetcher, 'get_market_wire_news'):
+                continue
+            try:
+                data = fetcher.get_market_wire_news(limit)
+                if data:
+                    logger.info(f"[{fetcher.name}] 获取市场电报成功: {len(data)} 条")
+                    return data
+            except Exception as e:
+                _error_type, error_reason = summarize_exception(e)
+                logger.warning(f"[{fetcher.name}] 获取市场电报失败: {error_reason}")
+        return []
+
     def get_concept_rankings(self, n: int = 5) -> Tuple[List[Dict], List[Dict]]:
         """获取概念/题材涨跌榜（自动切换数据源）。"""
         last_error = ""

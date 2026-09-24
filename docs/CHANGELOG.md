@@ -39,7 +39,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [新功能] 大盘复盘的行业涨跌榜新增「异动原因」列，按事件催化口径给出该行业当天为什么动：优先用一次 LLM 调用综合按行业检索的新闻与行业结构材料（申万二级子板块涨跌、板块内涨停股及连板数、领涨领跌个股），模型弃权或不可用时降级为子板块归因（如「主要由玻璃玻纤(-3.18%)拖累」），两者都拿不到显示 `-`；原因长度上限 120 字，禁止复述涨跌幅或涨跌家数。
 - [改进] 大盘复盘行业口径由东财二级行业板块（86 个细分板块）改为申万一级行业（31 个），与券商盘后复盘一致；数据源优先级 申万一级 → 东财二级 → 新浪，申万接口只返回点位故涨跌幅按 `(最新价-昨收盘)/昨收盘` 计算。榜单由 Top 5 改为 Top 3，表格去掉排名列，领涨/领跌表头分别为 `涨幅`/`跌幅`。
 - [新功能] AkShare 新增 `get_sector_catalyst_context`，采集行业异动归因材料：申万二级子板块归属取 `sw_index_second_info()` 的「上级行业」列（二级代码存在 22 个历史不规则，前缀匹配不可靠）、涨停池交叉行业成分股精确归因、全市场行情交叉成分股得出领涨领跌个股；全市场行情复用已有 20 分钟缓存并在东财失败时降级新浪。
-- [新功能] 新增 `MARKET_SECTOR_REASON_ENABLED`、`MARKET_SECTOR_NEWS_SEARCH_ENABLED`、`MARKET_SECTOR_NEWS_MAX_RESULTS` 三个配置；按行业检索新闻是催化依据的主要来源，每个展示的行业消耗一次搜索调用（默认 6 次），关闭后异动原因通常只剩子板块归因。
+- [新功能] 新增 `MARKET_SECTOR_REASON_ENABLED`、`MARKET_SECTOR_NEWS_SEARCH_ENABLED`、`MARKET_SECTOR_NEWS_MAX_RESULTS` 三个配置；按行业取新闻是催化依据的主要来源，关闭后异动原因通常只剩子板块归因。
+- [修复] 行业异动原因在未配置任何搜索 provider 时全部退化为「未检索到明确消息催化」：按行业取新闻改为双来源，通用网页搜索未命中的行业改用东财板块新闻 `stock_news_em`（接受任意关键词，传行业名即可，无需 API Key），市场级消息面用财联社电报 `stock_info_global_cls` 兜底；并过滤龙虎榜、`附股`、`低价股一览`、`盘中播报`、`行业涨跌幅最大`及 AI 批量生成的纯涨跌幅复述稿，避免诱导模型复述行情。
 - [改进] `market_review_payload.sectors` 追加可选 `reason`、`reason_source`（`llm` / `sub_sector_attribution`）、`taxonomy`（`sw_l1` / `em_l2` / `sina`）与 `code` 字段，`name` / `change_pct` 契约不变。
 
 ## [3.22.0] - 2026-06-13

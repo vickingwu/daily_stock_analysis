@@ -421,3 +421,110 @@ class TestMarketAnalyzerIntegration:
         ma._annotate_sector_reasons(overview, news=_news())
 
         assert "reason" not in overview.top_sectors[0]
+
+
+class TestNewsSourceDegradation:
+    """搜索 provider 未配置是常见部署形态，此时必须自动改用 akshare 板块新闻。"""
+
+    def _ma(self):
+        from src.market_analyzer import MarketAnalyzer
+
+        ma = MarketAnalyzer.__new__(MarketAnalyzer)
+        ma.config = SimpleNamespace(report_language="zh")
+        ma.region = "cn"
+        return ma
+
+    def test_uses_akshare_when_no_search_service(self):
+        ma = self._ma()
+        ma.search_service = None
+        ma.data_manager = SimpleNamespace(
+            get_sector_news=lambda names, max_items=3: {n: [{"title": f"{n}板块快讯"}] for n in names}
+        )
+
+        result = ma._search_sector_news([{"name": "煤炭"}, {"name": "银行"}])
+
+        assert result["煤炭"][0]["title"] == "煤炭板块快讯"
+        assert result["银行"][0]["title"] == "银行板块快讯"
+
+    def test_akshare_only_fills_industries_web_search_missed(self):
+        ma = self._ma()
+
+        def search_stock_news(stock_code, stock_name, max_results, focus_keywords):
+            if stock_name.startswith("煤炭"):
+                return SimpleNamespace(results=[{"title": "网页搜索命中"}])
+            return SimpleNamespace(results=[])
+
+        ma.search_service = SimpleNamespace(search_stock_news=search_stock_news)
+        asked = []
+
+        def get_sector_news(names, max_items=3):
+            asked.extend(names)
+            return {n: [{"title": f"{n}兜底"}] for n in names}
+
+        ma.data_manager = SimpleNamespace(get_sector_news=get_sector_news)
+
+        result = ma._search_sector_news([{"name": "煤炭"}, {"name": "银行"}])
+
+        assert result["煤炭"][0]["title"] == "网页搜索命中"   # 有 key 时以网页搜索为优
+        assert asked == ["银行"]                              # 只为未命中的行业兜底
+        assert result["银行"][0]["title"] == "银行兜底"
+
+    def test_disabled_switch_skips_both_sources(self):
+        ma = self._ma()
+        ma.config = SimpleNamespace(market_sector_news_search_enabled=False)
+        ma.search_service = SimpleNamespace(
+            search_stock_news=lambda **kw: (_ for _ in ()).throw(AssertionError("不该被调用"))
+        )
+        ma.data_manager = SimpleNamespace(
+            get_sector_news=lambda *a, **k: (_ for _ in ()).throw(AssertionError("不该被调用"))
+        )
+
+        assert ma._search_sector_news([{"name": "煤炭"}]) == {}
+
+    def test_akshare_failure_is_isolated(self):
+        ma = self._ma()
+        ma.search_service = None
+        ma.data_manager = SimpleNamespace(
+            get_sector_news=lambda names, max_items=3: (_ for _ in ()).throw(RuntimeError("down"))
+        )
+
+        assert ma._search_sector_news([{"name": "煤炭"}]) == {}
+
+    def test_market_wire_news_backfills_empty_market_news(self):
+        from src.market_analyzer import MarketOverview
+        from src.core.market_profile import get_profile
+
+        ma = self._ma()
+        ma.config = SimpleNamespace(report_language="zh", market_sector_reason_enabled=True)
+        ma.profile = get_profile("cn")
+        ma.search_service = None
+        captured = {}
+
+        def gen(prompt, max_tokens=None, temperature=None):
+            captured["prompt"] = prompt
+            return "煤炭 => 动力煤价格上涨带动"
+
+        ma.analyzer = SimpleNamespace(is_available=lambda: True, generate_text=gen)
+        ma.data_manager = SimpleNamespace(
+            get_sector_catalyst_context=lambda sectors: {},
+            get_sector_news=lambda names, max_items=3: {},
+            get_market_wire_news=lambda limit: [{"title": "财联社电报：动力煤价格走高"}],
+        )
+        overview = MarketOverview(
+            date="2026-09-24",
+            top_sectors=[{"name": "煤炭", "change_pct": 0.59}],
+            bottom_sectors=[],
+        )
+
+        ma._annotate_sector_reasons(overview, news=[])
+
+        assert "财联社电报：动力煤价格走高" in captured["prompt"]
+        assert overview.top_sectors[0]["reason"] == "动力煤价格上涨带动"
+
+    def test_wire_news_failure_is_isolated(self):
+        ma = self._ma()
+        ma.data_manager = SimpleNamespace(
+            get_market_wire_news=lambda limit: (_ for _ in ()).throw(RuntimeError("down"))
+        )
+
+        assert ma._get_market_wire_news() == []

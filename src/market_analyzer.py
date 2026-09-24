@@ -470,10 +470,12 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
         try:
             logger.info("[大盘] %s action=annotate_sector_reasons status=start", self._log_context())
             sectors = list(overview.top_sectors or []) + list(overview.bottom_sectors or [])
+            # 未配置搜索 provider 时 news 会是空的，用财联社电报补市场级消息面
+            market_news = list(news or []) or self._get_market_wire_news()
             stats = SectorDriverService(config=self.config, analyzer=self.analyzer).annotate(
                 overview.top_sectors,
                 overview.bottom_sectors,
-                news=news,
+                news=market_news,
                 sector_news=self._search_sector_news(sectors),
                 catalyst_context=self._get_sector_catalyst_context(sectors),
                 language=self._get_review_language(),
@@ -493,16 +495,76 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
             )
 
     def _search_sector_news(self, sectors: List[Dict]) -> Dict[str, List]:
-        """按行业逐个检索新闻。市场级查询覆盖不到单个行业，必须单独检索才有催化依据。"""
-        if not getattr(self, "search_service", None):
-            return {}
+        """按行业逐个取新闻。市场级查询覆盖不到单个行业，必须按行业取才有催化依据。
+
+        两条来源：
+        1. 通用网页搜索（配置了搜索 Key 时质量更高、时效可控）
+        2. 东财板块新闻（无需任何 Key），给上一步没命中的行业兜底
+
+        未配置任何搜索 provider 是常见部署形态，此时第 2 条就是唯一来源。
+        """
         if getattr(self.config, "market_sector_news_search_enabled", True) is not True:
             logger.info("[大盘] %s action=search_sector_news status=disabled", self._log_context())
             return {}
 
+        names: List[str] = []
+        for sector in sectors or []:
+            name = str((sector or {}).get("name") or "").strip()
+            if name and name not in names:
+                names.append(name)
+        if not names:
+            return {}
+
         max_results = max(1, int(getattr(self.config, "market_sector_news_max_results", 3) or 3))
+        result = self._search_sector_news_via_web(sectors, max_results)
+        web_hit = len(result)
+
+        missing = [name for name in names if name not in result]
+        if missing:
+            for name, items in self._fetch_sector_news_via_akshare(missing, max_results).items():
+                result[name] = items
+
+        logger.info(
+            "[大盘] %s action=search_sector_news status=success sectors=%d hit=%d web=%d akshare=%d",
+            self._log_context(), len(names), len(result), web_hit, len(result) - web_hit,
+        )
+        return result
+
+    def _fetch_sector_news_via_akshare(self, names: List[str], max_results: int) -> Dict[str, List]:
+        """用东财板块新闻兜底（无需搜索 API Key）。"""
+        manager = getattr(self, "data_manager", None)
+        if manager is None or not hasattr(manager, "get_sector_news"):
+            return {}
+        try:
+            return manager.get_sector_news(names, max_items=max_results) or {}
+        except Exception as exc:
+            logger.warning(
+                "[大盘] %s action=fetch_sector_news_akshare status=failed error=%s",
+                self._log_context(), exc,
+            )
+            return {}
+
+    def _get_market_wire_news(self, limit: int = 8) -> List[Dict]:
+        """市场级快讯兜底（财联社电报，无需搜索 API Key）。"""
+        manager = getattr(self, "data_manager", None)
+        if manager is None or not hasattr(manager, "get_market_wire_news"):
+            return []
+        try:
+            return list(manager.get_market_wire_news(limit) or [])
+        except Exception as exc:
+            logger.warning(
+                "[大盘] %s action=get_market_wire_news status=failed error=%s",
+                self._log_context(), exc,
+            )
+            return []
+
+    def _search_sector_news_via_web(self, sectors: List[Dict], max_results: int) -> Dict[str, List]:
+        """通用网页搜索路径；未配置 provider 时返回空，由 akshare 兜底。"""
+        if not getattr(self, "search_service", None):
+            return {}
+
         result: Dict[str, List] = {}
-        for sector in sectors:
+        for sector in sectors or []:
             name = str((sector or {}).get("name") or "").strip()
             if not name or name in result:
                 continue
@@ -520,11 +582,6 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
                     "[大盘] %s action=search_sector_news status=failed sector=%s error=%s",
                     self._log_context(), name, exc,
                 )
-
-        logger.info(
-            "[大盘] %s action=search_sector_news status=success sectors=%d hit=%d",
-            self._log_context(), len(sectors), len(result),
-        )
         return result
 
     def _get_sector_catalyst_context(self, sectors: List[Dict]) -> Dict[str, Dict]:
