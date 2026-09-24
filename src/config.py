@@ -898,8 +898,12 @@ class Config:
     run_immediately: bool = True              # 启动时是否立即执行一次（非定时模式）
     market_review_enabled: bool = True        # 是否启用大盘复盘
     daily_market_context_enabled: bool = True   # 是否将大盘环境摘要用于个股分析 Prompt 与保守护栏
-    # 板块异动原因是否调用大模型结合当日新闻解读；关闭后仅用板块内部结构（涨跌家数、龙头股）生成
+    # 行业异动原因是否调用大模型解读；关闭后仅做子板块归因
     market_sector_reason_enabled: bool = True
+    # 是否按行业逐个检索新闻（催化依据的主要来源，每个行业一次搜索调用）
+    market_sector_news_search_enabled: bool = True
+    # 每个行业检索的新闻条数
+    market_sector_news_max_results: int = 3
     # 大盘复盘市场区域：cn(A股)、hk(港股)、us(美股)、both(三市场)，us 适合仅关注美股的用户
     market_review_region: str = "cn"
     market_review_color_scheme: str = "green_up"
@@ -1706,6 +1710,13 @@ class Config:
             market_review_enabled=os.getenv('MARKET_REVIEW_ENABLED', 'true').lower() == 'true',
             daily_market_context_enabled=os.getenv('DAILY_MARKET_CONTEXT_ENABLED', 'true').lower() == 'true',
             market_sector_reason_enabled=os.getenv('MARKET_SECTOR_REASON_ENABLED', 'true').lower() != 'false',
+            market_sector_news_search_enabled=os.getenv(
+                'MARKET_SECTOR_NEWS_SEARCH_ENABLED', 'true'
+            ).lower() != 'false',
+            market_sector_news_max_results=parse_env_int(
+                os.getenv('MARKET_SECTOR_NEWS_MAX_RESULTS'), 3,
+                field_name='MARKET_SECTOR_NEWS_MAX_RESULTS', minimum=1, maximum=10,
+            ),
             market_review_region=cls._parse_market_review_region(
                 os.getenv('MARKET_REVIEW_REGION', 'cn')
             ),

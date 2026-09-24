@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
-"""Tests for the sector driver (板块异动原因) enrichment.
+"""Tests for the industry driver (行业异动原因) enrichment.
 
 Covers:
-- 事实层：仅靠板块榜单自带字段（涨跌家数、领涨个股）生成原因，中英双语
-- 解读层：LLM 返回「板块名 => 原因」的解析、噪声容忍、无依据与歧义时的丢弃
-- 降级路径：未配置模型 / 开关关闭 / 无新闻 / 调用抛错时退回事实层
-- 表格渲染：异动原因列的占位、管道符转义与长度截断
+- 解读层：LLM 输出解析、噪声容忍、无依据/未知/歧义行业名的丢弃、长度截断、表格安全
+- 归因层：模型弃权时只做子板块归因，且不得复述涨跌幅或涨跌家数
+- 降级路径：未配置模型 / 开关关闭 / 无任何新闻 / 调用抛错 / 返回 None
+- Prompt 契约：行业材料（子板块、涨停股、领涨领跌个股、行业新闻）必须进入 prompt
+- 集成：表格 Top3、涨幅/跌幅 表头、按行业检索新闻的调用与失败隔离
 """
 
 import sys
@@ -26,7 +27,7 @@ def _analyzer(response=None, *, available=True, raises=None):
     """Minimal analyzer double exposing only the public generate_text contract."""
 
     def generate_text(prompt, max_tokens=None, temperature=None):
-        generate_text.calls.append({"prompt": prompt, "max_tokens": max_tokens, "temperature": temperature})
+        generate_text.calls.append({"prompt": prompt, "max_tokens": max_tokens})
         if raises is not None:
             raise raises
         return response
@@ -35,176 +36,191 @@ def _analyzer(response=None, *, available=True, raises=None):
     return SimpleNamespace(generate_text=generate_text, is_available=lambda: available)
 
 
-def _news():
-    return [
-        {
-            "title": "发改委强调迎峰度夏煤炭保供",
-            "snippet": "要求主产区稳产增产，动力煤长协价格机制优化",
-            "source": "新华社",
-        },
-        {
-            "title": "多家云厂商上调AI算力资本开支指引",
-            "snippet": "光模块与服务器订单能见度延长至明年",
-            "source": "证券时报",
-        },
-    ]
+def _news(title="发改委部署迎峰度夏能源保供"):
+    return [{"title": title, "snippet": "要求主产区稳产增产", "source": "新华社"}]
 
 
-class TestFactualReason:
-    """事实层：不依赖任何网络请求与模型"""
+def _context(name="煤炭"):
+    """典型的一份行业材料，结构与 AkshareFetcher.get_sector_catalyst_context 一致。"""
+    return {
+        name: {
+            "sub_sectors": [
+                {"name": "焦炭Ⅱ", "change_pct": 2.08},
+                {"name": "煤炭开采", "change_pct": 0.78},
+            ],
+            "limit_up_stocks": [
+                {"name": "云煤能源", "change_pct": 10.02, "sub_industry": "煤炭开采", "streak": 2},
+            ],
+            "top_gainers": [{"name": "云煤能源", "change_pct": 10.02}],
+            "top_losers": [{"name": "平煤股份", "change_pct": -1.20}],
+        }
+    }
 
-    def test_uses_breadth_and_leader_for_leading_sector(self):
+
+class TestAttributionLayer:
+    """归因层：模型不可用时只回答「行业内部哪一块在动」，不复述涨跌幅。"""
+
+    def test_leading_industry_attributes_to_strongest_sub_sector(self):
+        top = [{"name": "煤炭", "change_pct": 1.04}]
+
+        stats = SectorDriverService().annotate(top, [], catalyst_context=_context())
+
+        assert top[0]["reason"] == (
+            "主要由焦炭Ⅱ(+2.08%)带动，云煤能源等涨停；未检索到明确消息催化"
+        )
+        assert top[0]["reason_source"] == "sub_sector_attribution"
+        assert stats == {"total": 1, "llm": 0, "attribution": 1, "empty": 0}
+
+    def test_lagging_industry_attributes_to_weakest_sub_sector(self):
+        bottom = [{"name": "建筑材料", "change_pct": -2.49}]
+        ctx = {
+            "建筑材料": {
+                "sub_sectors": [
+                    {"name": "装修建材", "change_pct": -1.61},
+                    {"name": "水泥", "change_pct": -1.97},
+                    {"name": "玻璃玻纤", "change_pct": -3.18},
+                ],
+            }
+        }
+
+        SectorDriverService().annotate([], bottom, catalyst_context=ctx)
+
+        assert bottom[0]["reason"] == "主要由玻璃玻纤(-3.18%)拖累；未检索到明确消息催化"
+
+    def test_lagging_industry_does_not_list_limit_up_stocks(self):
+        """领跌行业里零星涨停股不是异动原因，不应混进来。"""
+        bottom = [{"name": "煤炭", "change_pct": -1.0}]
+
+        SectorDriverService().annotate([], bottom, catalyst_context=_context())
+
+        assert "涨停" not in bottom[0]["reason"]
+        assert "煤炭开采" in bottom[0]["reason"]
+
+    def test_never_restates_breadth_or_change_pct(self):
+        """回归用例：旧实现会输出「35涨0跌，龙头xx +10%」，这类文案不是异动原因。"""
         top = [{
-            "name": "煤炭行业",
-            "change_pct": 5.22,
-            "up_count": 35,
-            "down_count": 0,
-            "leader_stock": "云煤能源",
-            "leader_change_pct": 10.12,
+            "name": "煤炭", "change_pct": 1.04,
+            "up_count": 35, "down_count": 0,
+            "leader_stock": "云煤能源", "leader_change_pct": 10.12,
         }]
 
-        stats = SectorDriverService().annotate(top, [])
+        SectorDriverService().annotate(top, [], catalyst_context=_context())
 
-        assert top[0]["reason"] == "35涨0跌，板块普涨，龙头云煤能源 +10.12%"
-        assert top[0]["reason_source"] == "board_internals"
-        assert stats == {"total": 1, "llm": 0, "factual": 1, "empty": 0}
+        reason = top[0]["reason"]
+        assert "涨0跌" not in reason
+        assert "龙头" not in reason
+        assert "板块普涨" not in reason
 
-    def test_lagging_sector_avoids_calling_best_performer_a_leader(self):
-        bottom = [{
-            "name": "银行",
-            "change_pct": -1.30,
-            "up_count": 2,
-            "down_count": 38,
-            "leader_stock": "成都银行",
-            "leader_change_pct": 0.45,
-        }]
+    def test_leaves_reason_absent_without_any_material(self):
+        top = [{"name": "煤炭", "change_pct": 1.04}]
 
-        SectorDriverService().annotate([], bottom)
-
-        assert bottom[0]["reason"] == "2涨38跌，板块普跌，板块内最强成都银行 +0.45%"
-
-    def test_marks_mixed_breadth_when_neither_side_dominates(self):
-        top = [{"name": "软件开发", "change_pct": 1.1, "up_count": 90, "down_count": 89}]
-
-        SectorDriverService().annotate(top, [])
-
-        assert top[0]["reason"] == "90涨89跌，板块内分化"
-
-    def test_falls_back_to_leader_only_when_breadth_missing(self):
-        """新浪备用源没有涨跌家数，只能给出领涨个股。"""
-        top = [{"name": "煤炭", "change_pct": 4.0, "leader_stock": "云煤能源", "leader_change_pct": 9.98}]
-
-        SectorDriverService().annotate(top, [])
-
-        assert top[0]["reason"] == "龙头云煤能源 +9.98%"
-
-    def test_leaves_reason_absent_when_no_internals_available(self):
-        top = [{"name": "煤炭行业", "change_pct": 5.22}]
-
-        stats = SectorDriverService().annotate(top, [])
+        stats = SectorDriverService().annotate(top, [], catalyst_context={})
 
         assert "reason" not in top[0]
-        assert stats == {"total": 1, "llm": 0, "factual": 0, "empty": 1}
+        assert stats == {"total": 1, "llm": 0, "attribution": 0, "empty": 1}
 
-    def test_english_language_renders_english_facts(self):
-        top = [{
-            "name": "Coal",
-            "change_pct": 5.22,
-            "up_count": 35,
-            "down_count": 0,
-            "leader_stock": "Yunmei Energy",
-            "leader_change_pct": 10.12,
-        }]
+    def test_english_attribution(self):
+        bottom = [{"name": "Building materials", "change_pct": -2.49}]
+        ctx = {"Building materials": {"sub_sectors": [{"name": "Glass fiber", "change_pct": -3.18}]}}
 
-        SectorDriverService().annotate(top, [], language="en")
+        SectorDriverService().annotate([], bottom, catalyst_context=ctx, language="en")
 
-        assert top[0]["reason"] == "35 up / 0 down, broad advance; led by Yunmei Energy +10.12%"
-
-
-class TestLlmReason:
-    def test_parses_llm_lines_and_prefers_them_over_facts(self):
-        analyzer = _analyzer(
-            "煤炭行业 => 发改委保供增产，长协价机制优化\n"
-            "光模块 => 云厂商上调AI资本开支\n"
+        assert bottom[0]["reason"] == (
+            "mainly dragged down by Glass fiber (-3.18%); no clear news catalyst found"
         )
-        top = [
-            {"name": "煤炭行业", "change_pct": 5.22, "up_count": 35, "down_count": 0},
-            {"name": "光模块", "change_pct": 4.1},
-        ]
 
-        stats = SectorDriverService(analyzer=analyzer).annotate(top, [], news=_news())
 
-        assert top[0]["reason"] == "发改委保供增产，长协价机制优化"
+class TestLlmLayer:
+    def test_parses_and_prefers_llm_reason(self):
+        analyzer = _analyzer(
+            "煤炭 => 发改委保供表态叠加长协价机制优化，焦炭Ⅱ领涨，港口库存降至近三年低位"
+        )
+        top = [{"name": "煤炭", "change_pct": 1.04}]
+
+        stats = SectorDriverService(analyzer=analyzer).annotate(
+            top, [], news=_news(), catalyst_context=_context()
+        )
+
+        assert top[0]["reason"].startswith("发改委保供表态")
         assert top[0]["reason_source"] == "llm"
-        assert top[1]["reason"] == "云厂商上调AI资本开支"
-        assert stats == {"total": 2, "llm": 2, "factual": 0, "empty": 0}
+        assert stats == {"total": 1, "llm": 1, "attribution": 0, "empty": 0}
 
-    def test_prompt_carries_sector_clues_and_news(self):
-        analyzer = _analyzer("煤炭行业 => 保供预期升温")
-        top = [{"name": "煤炭行业", "change_pct": 5.22, "up_count": 35, "down_count": 0}]
+    def test_prompt_carries_all_industry_material(self):
+        analyzer = _analyzer("煤炭 => 保供预期升温")
+        top = [{"name": "煤炭", "change_pct": 1.04}]
 
-        SectorDriverService(analyzer=analyzer).annotate(top, [], news=_news())
+        SectorDriverService(analyzer=analyzer).annotate(
+            top, [],
+            news=[{"title": "市场级新闻标题", "snippet": "摘要", "source": "证券时报"}],
+            sector_news={"煤炭": _news("煤炭行业专属新闻")},
+            catalyst_context=_context(),
+        )
 
         prompt = analyzer.generate_text.calls[0]["prompt"]
-        assert "领涨 煤炭行业 +5.22%" in prompt
-        assert "35涨0跌，板块普涨" in prompt
-        assert "发改委强调迎峰度夏煤炭保供" in prompt
-        assert "不得编造" in prompt
+        assert "领涨 煤炭 +1.04%" in prompt
+        assert "焦炭Ⅱ +2.08%" in prompt                 # 子板块
+        assert "云煤能源(煤炭开采/2板)" in prompt          # 涨停股含子行业与连板数
+        assert "平煤股份 -1.20%" in prompt                # 领跌个股
+        assert "煤炭行业专属新闻" in prompt               # 按行业检索的新闻
+        assert "市场级新闻标题" in prompt                 # 市场级新闻
+        # 反「复述涨跌幅」的硬约束必须在 prompt 里
+        assert "禁止只复述涨跌幅" in prompt
 
-    def test_tolerates_bullets_numbering_and_trailing_change_pct(self):
+    def test_tolerates_bullets_numbering_and_fences(self):
         analyzer = _analyzer(
-            "```\n"
-            "1. 煤炭行业 (+5.22%)：发改委保供增产\n"
-            "- 光模块 → 算力订单能见度延长\n"
-            "```"
+            "```\n1. 煤炭 (+1.04%)：发改委保供增产\n- 建筑材料 → 地产需求疲软\n```"
         )
-        top = [{"name": "煤炭行业", "change_pct": 5.22}, {"name": "光模块", "change_pct": 4.1}]
+        top = [{"name": "煤炭", "change_pct": 1.04}]
+        bottom = [{"name": "建筑材料", "change_pct": -2.49}]
 
-        SectorDriverService(analyzer=analyzer).annotate(top, [], news=_news())
+        SectorDriverService(analyzer=analyzer).annotate(
+            top, bottom, news=_news(), catalyst_context=_context()
+        )
 
         assert top[0]["reason"] == "发改委保供增产"
-        assert top[1]["reason"] == "算力订单能见度延长"
+        assert bottom[0]["reason"] == "地产需求疲软"
 
-    @pytest.mark.parametrize("token", ["无", "none", "N/A", "暂无数据", "-"])
-    def test_drops_reasons_the_model_marked_unavailable(self, token):
-        analyzer = _analyzer(f"煤炭行业 => {token}")
-        top = [{"name": "煤炭行业", "change_pct": 5.22, "up_count": 35, "down_count": 0}]
+    @pytest.mark.parametrize("token", ["无", "none", "N/A", "暂无数据", "-", "弃权"])
+    def test_falls_back_when_model_abstains(self, token):
+        analyzer = _analyzer(f"煤炭 => {token}")
+        top = [{"name": "煤炭", "change_pct": 1.04}]
+
+        SectorDriverService(analyzer=analyzer).annotate(
+            top, [], news=_news(), catalyst_context=_context()
+        )
+
+        assert top[0]["reason_source"] == "sub_sector_attribution"
+        assert "焦炭Ⅱ" in top[0]["reason"]
+
+    def test_drops_unknown_industry_name(self):
+        analyzer = _analyzer("白酒 => 春节备货超预期")
+        top = [{"name": "煤炭", "change_pct": 1.04}]
 
         SectorDriverService(analyzer=analyzer).annotate(top, [], news=_news())
 
-        # 退回事实层而不是写入 "无"
-        assert top[0]["reason"] == "35涨0跌，板块普涨"
-        assert top[0]["reason_source"] == "board_internals"
+        assert "reason" not in top[0]
 
-    def test_drops_ambiguous_sector_name_instead_of_guessing(self):
-        analyzer = _analyzer("煤炭 => 保供预期升温")
-        top = [{"name": "煤炭行业", "change_pct": 5.22}, {"name": "煤炭开采", "change_pct": 4.9}]
+    def test_drops_ambiguous_industry_name(self):
+        analyzer = _analyzer("银行 => 高股息受青睐")
+        top = [{"name": "国有大型银行", "change_pct": 1.0}, {"name": "城商行银行", "change_pct": 0.9}]
 
         SectorDriverService(analyzer=analyzer).annotate(top, [], news=_news())
 
         assert "reason" not in top[0]
         assert "reason" not in top[1]
 
-    def test_ignores_unknown_sector_names(self):
-        analyzer = _analyzer("白酒 => 春节备货超预期")
-        top = [{"name": "煤炭行业", "change_pct": 5.22}]
+    def test_truncates_at_120_chars(self):
+        analyzer = _analyzer(f"煤炭 => {'政策预期升温' * 40}")
+        top = [{"name": "煤炭", "change_pct": 1.04}]
 
         SectorDriverService(analyzer=analyzer).annotate(top, [], news=_news())
 
-        assert "reason" not in top[0]
-
-    def test_truncates_overlong_llm_reason(self):
-        analyzer = _analyzer(f"煤炭行业 => {'政策预期' * 20}")
-        top = [{"name": "煤炭行业", "change_pct": 5.22}]
-
-        SectorDriverService(analyzer=analyzer).annotate(top, [], news=_news())
-
-        assert len(top[0]["reason"]) == SectorDriverService.MAX_REASON_CHARS
+        assert len(top[0]["reason"]) == SectorDriverService.MAX_REASON_CHARS == 120
         assert top[0]["reason"].endswith("...")
 
-    def test_strips_pipe_to_keep_markdown_table_intact(self):
-        analyzer = _analyzer("煤炭行业 => 保供增产 | 长协优化")
-        top = [{"name": "煤炭行业", "change_pct": 5.22}]
+    def test_strips_pipe_to_keep_table_intact(self):
+        analyzer = _analyzer("煤炭 => 保供增产 | 长协优化")
+        top = [{"name": "煤炭", "change_pct": 1.04}]
 
         SectorDriverService(analyzer=analyzer).annotate(top, [], news=_news())
 
@@ -212,113 +228,196 @@ class TestLlmReason:
         assert top[0]["reason"] == "保供增产 / 长协优化"
 
 
-class TestLlmDegradation:
+class TestDegradation:
     def _top(self):
-        return [{"name": "煤炭行业", "change_pct": 5.22, "up_count": 35, "down_count": 0}]
+        return [{"name": "煤炭", "change_pct": 1.04}]
 
-    def test_skips_llm_without_news(self):
-        analyzer = _analyzer("煤炭行业 => 不该被调用")
+    def test_sector_news_alone_is_enough_to_call_llm(self):
+        """只有行业新闻、没有市场级新闻时也应调用模型。"""
+        analyzer = _analyzer("煤炭 => 保供预期升温")
         top = self._top()
 
-        SectorDriverService(analyzer=analyzer).annotate(top, [], news=[])
+        SectorDriverService(analyzer=analyzer).annotate(
+            top, [], news=[], sector_news={"煤炭": _news()}
+        )
+
+        assert analyzer.generate_text.calls
+        assert top[0]["reason_source"] == "llm"
+
+    def test_skips_llm_without_any_news(self):
+        analyzer = _analyzer("煤炭 => 不该被调用")
+        top = self._top()
+
+        SectorDriverService(analyzer=analyzer).annotate(
+            top, [], news=[], sector_news={}, catalyst_context=_context()
+        )
 
         assert analyzer.generate_text.calls == []
-        assert top[0]["reason_source"] == "board_internals"
+        assert top[0]["reason_source"] == "sub_sector_attribution"
 
     def test_skips_llm_when_config_disables_it(self):
-        analyzer = _analyzer("煤炭行业 => 不该被调用")
-        config = SimpleNamespace(market_sector_reason_enabled=False)
+        analyzer = _analyzer("煤炭 => 不该被调用")
         top = self._top()
 
-        SectorDriverService(config=config, analyzer=analyzer).annotate(top, [], news=_news())
+        SectorDriverService(
+            config=SimpleNamespace(market_sector_reason_enabled=False), analyzer=analyzer
+        ).annotate(top, [], news=_news(), catalyst_context=_context())
 
         assert analyzer.generate_text.calls == []
-        assert top[0]["reason_source"] == "board_internals"
+        assert top[0]["reason_source"] == "sub_sector_attribution"
 
     def test_skips_llm_when_analyzer_unavailable(self):
-        analyzer = _analyzer("煤炭行业 => 不该被调用", available=False)
+        analyzer = _analyzer("煤炭 => 不该被调用", available=False)
         top = self._top()
 
-        SectorDriverService(analyzer=analyzer).annotate(top, [], news=_news())
+        SectorDriverService(analyzer=analyzer).annotate(
+            top, [], news=_news(), catalyst_context=_context()
+        )
 
         assert analyzer.generate_text.calls == []
-        assert top[0]["reason_source"] == "board_internals"
 
     def test_falls_back_when_generate_text_raises(self):
-        analyzer = _analyzer(raises=RuntimeError("llm down"))
         top = self._top()
 
-        SectorDriverService(analyzer=analyzer).annotate(top, [], news=_news())
+        SectorDriverService(analyzer=_analyzer(raises=RuntimeError("llm down"))).annotate(
+            top, [], news=_news(), catalyst_context=_context()
+        )
 
-        assert top[0]["reason"] == "35涨0跌，板块普涨"
-        assert top[0]["reason_source"] == "board_internals"
+        assert top[0]["reason_source"] == "sub_sector_attribution"
 
     def test_falls_back_when_generate_text_returns_none(self):
-        analyzer = _analyzer(None)
         top = self._top()
 
-        SectorDriverService(analyzer=analyzer).annotate(top, [], news=_news())
+        SectorDriverService(analyzer=_analyzer(None)).annotate(
+            top, [], news=_news(), catalyst_context=_context()
+        )
 
-        assert top[0]["reason_source"] == "board_internals"
+        assert top[0]["reason_source"] == "sub_sector_attribution"
 
-    def test_handles_empty_and_malformed_sector_lists(self):
-        assert SectorDriverService().annotate(None, None) == {
-            "total": 0, "llm": 0, "factual": 0, "empty": 0,
-        }
-        assert SectorDriverService().annotate([{"name": ""}, "bad"], []) == {
-            "total": 0, "llm": 0, "factual": 0, "empty": 0,
-        }
+    def test_handles_empty_and_malformed_inputs(self):
+        empty = {"total": 0, "llm": 0, "attribution": 0, "empty": 0}
+        assert SectorDriverService().annotate(None, None) == empty
+        assert SectorDriverService().annotate([{"name": ""}, "bad"], []) == empty
 
 
 class TestMarketAnalyzerIntegration:
-    def _analyzer_instance(self):
+    def _ma(self):
         from src.market_analyzer import MarketAnalyzer
 
-        return MarketAnalyzer.__new__(MarketAnalyzer)
+        ma = MarketAnalyzer.__new__(MarketAnalyzer)
+        ma.config = SimpleNamespace(market_review_color_scheme="green_up", report_language="zh")
+        ma.region = "cn"
+        return ma
 
-    def test_sector_block_renders_driver_column(self):
+    def test_table_is_top3_with_separate_gain_loss_headers(self):
         from src.market_analyzer import MarketOverview
 
-        ma = self._analyzer_instance()
-        ma.config = SimpleNamespace(market_review_color_scheme="green_up", report_language="zh")
+        ma = self._ma()
         overview = MarketOverview(
-            date="2026-03-05",
-            top_sectors=[{"name": "煤炭行业", "change_pct": 5.22, "reason": "发改委保供增产"}],
-            bottom_sectors=[{"name": "银行", "change_pct": -1.3}],
+            date="2026-09-24",
+            top_sectors=[
+                {"name": "煤炭", "change_pct": 1.04, "reason": "发改委保供表态"},
+                {"name": "银行", "change_pct": 0.68, "reason": "高股息防御"},
+                {"name": "纺织服饰", "change_pct": 0.52, "reason": "纺织制造走强"},
+                {"name": "多余行业", "change_pct": 0.40, "reason": "不应出现"},
+            ],
+            bottom_sectors=[{"name": "有色金属", "change_pct": -2.79}],
         )
 
         block = ma._build_sector_block(overview)
 
-        assert "| 排名 | 板块 | 涨跌幅 | 异动原因 |" in block
-        assert "| 1 | 煤炭行业 | +5.22% | 发改委保供增产 |" in block
-        assert "| 1 | 银行 | -1.30% | - |" in block
+        assert "#### 领涨行业 Top 3" in block
+        assert "| 行业 | 涨幅 | 异动原因 |" in block
+        assert "#### 领跌行业 Top 3" in block
+        assert "| 行业 | 跌幅 | 异动原因 |" in block
+        assert "| 煤炭 | +1.04% | 发改委保供表态 |" in block
+        assert "| 有色金属 | -2.79% | - |" in block
+        # 只保留 Top3，且不再有排名列
+        assert "多余行业" not in block
+        assert "| 排名 |" not in block
 
-    def test_prompt_sectors_include_reason_hint(self):
-        ma = self._analyzer_instance()
+    def test_search_sector_news_queries_each_industry(self):
+        ma = self._ma()
+        ma.config = SimpleNamespace(report_language="zh")
+        calls = []
 
-        text = ma._format_prompt_sectors([
-            {"name": "煤炭行业", "change_pct": 5.22, "reason": "发改委保供增产"},
-            {"name": "光模块", "change_pct": 4.1},
-        ])
+        def search_stock_news(stock_code, stock_name, max_results, focus_keywords):
+            calls.append({"name": stock_name, "keywords": focus_keywords})
+            return SimpleNamespace(results=[{"title": f"{stock_name}新闻"}])
 
-        assert text == "煤炭行业(+5.22%)[发改委保供增产], 光模块(+4.10%)"
+        ma.search_service = SimpleNamespace(search_stock_news=search_stock_news)
 
-    def test_annotate_sector_reasons_never_raises(self):
+        result = ma._search_sector_news([{"name": "煤炭"}, {"name": "银行"}, {"name": "煤炭"}])
+
+        assert set(result) == {"煤炭", "银行"}
+        assert [c["name"] for c in calls] == ["煤炭行业", "银行行业"]  # 去重后逐个检索
+        assert "煤炭" in calls[0]["keywords"]
+
+    def test_search_sector_news_can_be_disabled(self):
+        ma = self._ma()
+        ma.config = SimpleNamespace(market_sector_news_search_enabled=False)
+        ma.search_service = SimpleNamespace(
+            search_stock_news=lambda **kw: (_ for _ in ()).throw(AssertionError("不该被调用"))
+        )
+
+        assert ma._search_sector_news([{"name": "煤炭"}]) == {}
+
+    def test_search_sector_news_isolates_per_industry_failure(self):
+        ma = self._ma()
+        ma.config = SimpleNamespace(report_language="zh")
+
+        def search_stock_news(stock_code, stock_name, max_results, focus_keywords):
+            if stock_name.startswith("煤炭"):
+                raise RuntimeError("search down")
+            return SimpleNamespace(results=[{"title": "ok"}])
+
+        ma.search_service = SimpleNamespace(search_stock_news=search_stock_news)
+
+        result = ma._search_sector_news([{"name": "煤炭"}, {"name": "银行"}])
+
+        assert "煤炭" not in result
+        assert "银行" in result
+
+    def test_annotate_never_raises_and_still_attributes(self):
         from src.market_analyzer import MarketOverview
         from src.core.market_profile import get_profile
 
-        ma = self._analyzer_instance()
-        ma.config = SimpleNamespace(report_language="zh")
-        ma.region = "cn"
+        ma = self._ma()
         ma.profile = get_profile("cn")
-        ma.analyzer = SimpleNamespace(is_available=lambda: (_ for _ in ()).throw(RuntimeError("boom")))
+        ma.search_service = None
+        ma.analyzer = SimpleNamespace(
+            is_available=lambda: (_ for _ in ()).throw(RuntimeError("boom"))
+        )
+        ma.data_manager = SimpleNamespace(
+            get_sector_catalyst_context=lambda sectors: _context()
+        )
         overview = MarketOverview(
-            date="2026-03-05",
-            top_sectors=[{"name": "煤炭行业", "change_pct": 5.22, "up_count": 35, "down_count": 0}],
+            date="2026-09-24",
+            top_sectors=[{"name": "煤炭", "change_pct": 1.04}],
             bottom_sectors=[],
         )
 
         ma._annotate_sector_reasons(overview, news=_news())
 
-        # analyzer 探测失败也要降级到事实层，而不是冒泡到复盘主流程
-        assert overview.top_sectors[0]["reason"] == "35涨0跌，板块普涨"
+        assert "焦炭Ⅱ" in overview.top_sectors[0]["reason"]
+
+    def test_annotate_survives_catalyst_source_failure(self):
+        from src.market_analyzer import MarketOverview
+        from src.core.market_profile import get_profile
+
+        ma = self._ma()
+        ma.profile = get_profile("cn")
+        ma.search_service = None
+        ma.analyzer = None
+        ma.data_manager = SimpleNamespace(
+            get_sector_catalyst_context=lambda sectors: (_ for _ in ()).throw(RuntimeError("boom"))
+        )
+        overview = MarketOverview(
+            date="2026-09-24",
+            top_sectors=[{"name": "煤炭", "change_pct": 1.04}],
+            bottom_sectors=[],
+        )
+
+        ma._annotate_sector_reasons(overview, news=_news())
+
+        assert "reason" not in overview.top_sectors[0]

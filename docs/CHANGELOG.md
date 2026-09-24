@@ -36,8 +36,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [文档] 补充 AlphaSift 迁移与回退边界：明确 `ALPHASIFT_INSTALL_SPEC` 显式覆盖语义、`requirements.txt + DEFAULT_ALPHASIFT_INSTALL_SPEC` 与运行时兼容边界、以及回滚路径（关闭功能/完整 revert）说明，覆盖旧 pin 用户升级行为。
 
 - [新功能] 个股分析历史成功保存后会从最终报告 best-effort 提取 `DecisionSignal` 决策信号，复用现有信号去重、计划质量计算和脱敏契约。
-- [新功能] 大盘复盘的领涨/领跌板块表格新增「异动原因」列：优先用一次小额 LLM 调用结合当日市场新闻归纳驱动因素，未配置模型、无可用新闻或调用失败时降级为板块内部结构（涨跌家数、领涨个股）描述，两者都拿不到时显示 `-`；新增 `MARKET_SECTOR_REASON_ENABLED` 开关，`market_review_payload.sectors` 追加可选 `reason` / `reason_source` 字段，`name` / `change_pct` 契约不变。
-- [改进] AkShare 板块涨跌榜透传板块榜单接口自带的板块内部结构（东财 `上涨家数`/`下跌家数`/`领涨股票`/`领涨股票-涨跌幅`，新浪 `公司家数`/`股票名称`/`个股-涨跌幅`），不额外发起请求，缺列时自动省略字段。
+- [新功能] 大盘复盘的行业涨跌榜新增「异动原因」列，按事件催化口径给出该行业当天为什么动：优先用一次 LLM 调用综合按行业检索的新闻与行业结构材料（申万二级子板块涨跌、板块内涨停股及连板数、领涨领跌个股），模型弃权或不可用时降级为子板块归因（如「主要由玻璃玻纤(-3.18%)拖累」），两者都拿不到显示 `-`；原因长度上限 120 字，禁止复述涨跌幅或涨跌家数。
+- [改进] 大盘复盘行业口径由东财二级行业板块（86 个细分板块）改为申万一级行业（31 个），与券商盘后复盘一致；数据源优先级 申万一级 → 东财二级 → 新浪，申万接口只返回点位故涨跌幅按 `(最新价-昨收盘)/昨收盘` 计算。榜单由 Top 5 改为 Top 3，表格去掉排名列，领涨/领跌表头分别为 `涨幅`/`跌幅`。
+- [新功能] AkShare 新增 `get_sector_catalyst_context`，采集行业异动归因材料：申万二级子板块归属取 `sw_index_second_info()` 的「上级行业」列（二级代码存在 22 个历史不规则，前缀匹配不可靠）、涨停池交叉行业成分股精确归因、全市场行情交叉成分股得出领涨领跌个股；全市场行情复用已有 20 分钟缓存并在东财失败时降级新浪。
+- [新功能] 新增 `MARKET_SECTOR_REASON_ENABLED`、`MARKET_SECTOR_NEWS_SEARCH_ENABLED`、`MARKET_SECTOR_NEWS_MAX_RESULTS` 三个配置；按行业检索新闻是催化依据的主要来源，每个展示的行业消耗一次搜索调用（默认 6 次），关闭后异动原因通常只剩子板块归因。
+- [改进] `market_review_payload.sectors` 追加可选 `reason`、`reason_source`（`llm` / `sub_sector_attribution`）、`taxonomy`（`sw_l1` / `em_l2` / `sina`）与 `code` 字段，`name` / `change_pct` 契约不变。
 
 ## [3.22.0] - 2026-06-13
 

@@ -3048,6 +3048,62 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         ],
         "warning_codes": [],
     },
+    "MARKET_SECTOR_NEWS_SEARCH_ENABLED": {
+        "title": "Industry Driver News Search",
+        "description": (
+            "Search news per leading/lagging industry to ground the driver column. "
+            "Costs one search call per industry shown; when disabled the driver column falls back "
+            "to sub-industry attribution only."
+        ),
+        "category": "system",
+        "data_type": "boolean",
+        "ui_control": "switch",
+        "is_sensitive": False,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": "true",
+        "options": [],
+        "validation": {},
+        "display_order": 54,
+        "help_key": "settings.system.market_review",
+        "examples": [
+            "MARKET_SECTOR_NEWS_SEARCH_ENABLED=true",
+            "MARKET_SECTOR_NEWS_SEARCH_ENABLED=false",
+        ],
+        "docs": [
+            {
+                "label": "完整指南：环境变量完整列表",
+                "href": "https://github.com/ZhuLinsen/daily_stock_analysis/blob/main/docs/full-guide.md#环境变量完整列表",
+            },
+        ],
+        "warning_codes": [],
+    },
+    "MARKET_SECTOR_NEWS_MAX_RESULTS": {
+        "title": "Industry Driver News Results",
+        "description": "How many news items to retrieve per industry when grounding the driver column.",
+        "category": "system",
+        "data_type": "integer",
+        "ui_control": "number",
+        "is_sensitive": False,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": "3",
+        "options": [],
+        "validation": {"min": 1, "max": 10},
+        "display_order": 56,
+        "help_key": "settings.system.market_review",
+        "examples": [
+            "MARKET_SECTOR_NEWS_MAX_RESULTS=3",
+            "MARKET_SECTOR_NEWS_MAX_RESULTS=5",
+        ],
+        "docs": [
+            {
+                "label": "完整指南：环境变量完整列表",
+                "href": "https://github.com/ZhuLinsen/daily_stock_analysis/blob/main/docs/full-guide.md#环境变量完整列表",
+            },
+        ],
+        "warning_codes": [],
+    },
     "MARKET_REVIEW_REGION": {
         "title": "Market Review Region",
         "description": "Market region for review: cn (A-shares), hk (Hong Kong), us (US stocks), or both (all markets).",

@@ -3421,6 +3421,35 @@ class DataFetcherManager:
         logger.warning(f"[板块排行] 所有数据源均失败，最终错误: {last_error}")
         return [], []
 
+    def get_sector_catalyst_context(
+        self,
+        sectors: List[Dict[str, Any]],
+        **kwargs: Any,
+    ) -> Dict[str, Dict[str, Any]]:
+        """获取行业异动归因材料（可选能力，仅部分数据源实现）。
+
+        任一数据源成功即返回；全部失败返回空字典，不影响复盘主流程。
+        """
+        if not sectors:
+            return {}
+        last_error = ""
+        for fetcher in self._fetchers:
+            if not hasattr(fetcher, 'get_sector_catalyst_context'):
+                continue
+            try:
+                data = fetcher.get_sector_catalyst_context(sectors, **kwargs)
+                if data:
+                    logger.info(f"[{fetcher.name}] 获取行业异动归因材料成功")
+                    return data
+                last_error = f"{fetcher.name}返回空结果"
+            except Exception as e:
+                _error_type, error_reason = summarize_exception(e)
+                last_error = f"{fetcher.name} {error_reason}"
+                logger.warning(f"[{fetcher.name}] 获取行业异动归因材料失败: {error_reason}")
+        if last_error:
+            logger.warning(f"[行业归因] 所有数据源均未返回材料，最终错误: {last_error}")
+        return {}
+
     def get_concept_rankings(self, n: int = 5) -> Tuple[List[Dict], List[Dict]]:
         """获取概念/题材涨跌榜（自动切换数据源）。"""
         last_error = ""

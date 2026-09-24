@@ -1,14 +1,18 @@
 # -*- coding: utf-8 -*-
-"""板块异动原因服务。
+"""行业异动原因服务。
 
-为大盘复盘的领涨 / 领跌板块各补一条一句话「异动原因」，供推送表格展示。
+为大盘复盘的领涨 / 领跌行业各补一条「异动原因」，说明该行业当天为什么动，
+供推送表格展示。目标是事件催化口径（政策、消息、外盘、资金、龙头股），
+而不是把涨跌幅换个说法复述一遍。
 
 原因来源分两层，由高到低：
 
-1. 解读层（可选）：把当日已抓取的市场新闻与板块线索一起交给大模型，归纳板块
-   「为什么动」。未配置模型、没有可用新闻、调用失败或模型给不出依据时自动降级。
-2. 事实层：只使用板块榜单自带的板块内部结构（上涨 / 下跌家数、领涨个股），
-   不额外请求任何接口，始终可用。
+1. 解读层：把当日检索到的行业新闻，与行业结构材料（申万二级子板块涨跌、
+   板块内涨停股、领涨领跌个股）一起交给大模型，归纳成一句催化说明。
+   模型只能依据给定材料，给不出依据的行业必须弃权。
+2. 归因层：模型弃权或不可用时，只做子板块归因（「主要由玻璃玻纤拖累」），
+   这与券商复盘里「主要是航运港口板块走弱」同类，属于对「为什么」的回答；
+   不使用涨跌家数、涨跌幅复述这类与原因无关的描述。
 
 两层都拿不到时留空，表格显示 "-"。本模块不向上抛异常，保证单点失败不影响
 大盘复盘主流程。
@@ -24,11 +28,11 @@ logger = logging.getLogger(__name__)
 
 # 模型表示「给不出原因」时可能返回的各种写法，统一视为无结果
 _REASON_UNAVAILABLE_TOKENS = frozenset({
-    "-", "--", "—", "无", "无。", "暂无", "暂无数据", "暂无依据", "未知", "不详",
-    "none", "n/a", "na", "null", "unknown", "unclear", "no reason", "no data",
+    "-", "--", "—", "无", "无。", "暂无", "暂无数据", "暂无依据", "未知", "不详", "弃权",
+    "none", "n/a", "na", "null", "unknown", "unclear", "no reason", "no data", "skip",
 })
 
-# 解析「板块名 => 原因」，容忍模型附带序号、项目符号与多种分隔符
+# 解析「行业名 => 原因」，容忍模型附带序号、项目符号与多种分隔符
 _REASON_LINE_PATTERN = re.compile(
     r"^\s*(?:[-*•]|\d+\s*[.)、])?\s*(?P<name>.+?)\s*(?:=>|=＞|->|→|::|：|:)\s*(?P<reason>.+?)\s*$"
 )
@@ -57,15 +61,6 @@ def _news_field(item: Any, field: str) -> str:
     return ""
 
 
-def _to_int(value: Any) -> Optional[int]:
-    try:
-        if value is None or isinstance(value, bool):
-            return None
-        return int(value)
-    except (TypeError, ValueError):
-        return None
-
-
 def _to_float(value: Any) -> Optional[float]:
     try:
         if value is None or isinstance(value, bool):
@@ -75,18 +70,26 @@ def _to_float(value: Any) -> Optional[float]:
         return None
 
 
+def _fmt_pct(value: Any) -> str:
+    num = _to_float(value)
+    return "N/A" if num is None else f"{num:+.2f}%"
+
+
 class SectorDriverService:
-    """推断板块异动原因，并就地写回板块字典的 ``reason`` 字段。"""
+    """推断行业异动原因，并就地写回行业字典的 ``reason`` 字段。"""
 
-    # 原因文案长度上限：中文按字符数控制，英文放宽以容纳单词
-    MAX_REASON_CHARS = 30
-    MAX_REASON_CHARS_EN = 64
+    # 原因文案长度上限：对齐券商复盘口径，需要容纳政策名、个股名与因果链
+    MAX_REASON_CHARS = 120
+    MAX_REASON_CHARS_EN = 240
 
-    _LLM_MAX_TOKENS = 700
-    _LLM_TEMPERATURE = 0.2
-    _MAX_NEWS_ITEMS = 8
-    _NEWS_TITLE_LIMIT = 80
-    _NEWS_SNIPPET_LIMIT = 110
+    _LLM_MAX_TOKENS = 3000
+    _LLM_TEMPERATURE = 0.3
+    _MAX_MARKET_NEWS = 6
+    _MAX_SECTOR_NEWS = 4
+    _NEWS_TITLE_LIMIT = 90
+    _NEWS_SNIPPET_LIMIT = 130
+    _MAX_SUB_SECTORS = 5
+    _MAX_STOCK_EXAMPLES = 4
 
     def __init__(self, config: Any = None, analyzer: Any = None) -> None:
         self.config = config
@@ -101,26 +104,40 @@ class SectorDriverService:
         bottom_sectors: Optional[List[Dict[str, Any]]],
         *,
         news: Optional[Sequence[Any]] = None,
+        sector_news: Optional[Dict[str, Sequence[Any]]] = None,
+        catalyst_context: Optional[Dict[str, Dict[str, Any]]] = None,
         language: str = "zh",
     ) -> Dict[str, int]:
-        """给领涨 / 领跌板块写入 ``reason`` 与 ``reason_source``。
+        """给领涨 / 领跌行业写入 ``reason`` 与 ``reason_source``。
 
         Args:
-            top_sectors: 领涨板块列表，元素为 dict，就地修改
-            bottom_sectors: 领跌板块列表，元素为 dict，就地修改
-            news: 当日市场新闻（SearchResult 或 dict 列表），用于解读层
+            top_sectors: 领涨行业列表，元素为 dict，就地修改
+            bottom_sectors: 领跌行业列表，元素为 dict，就地修改
+            news: 市场级新闻（SearchResult 或 dict 列表）
+            sector_news: ``{行业名: 该行业新闻列表}``，按行业单独检索的结果
+            catalyst_context: ``{行业名: {sub_sectors, limit_up_stocks,
+                top_gainers, top_losers}}``，见 AkshareFetcher.get_sector_catalyst_context
             language: 报告语言，"en" 输出英文原因，其余按中文处理
 
         Returns:
             Dict: 各来源命中数量，供调用方打日志，形如
-            ``{"total": 10, "llm": 6, "factual": 3, "empty": 1}``
+            ``{"total": 6, "llm": 5, "attribution": 1, "empty": 0}``
         """
         entries = self._collect_entries(top_sectors, bottom_sectors)
-        stats = {"total": len(entries), "llm": 0, "factual": 0, "empty": 0}
+        stats = {"total": len(entries), "llm": 0, "attribution": 0, "empty": 0}
         if not entries:
             return stats
 
-        llm_reasons = self._build_llm_reasons(entries, news=news, language=language)
+        context = catalyst_context or {}
+        per_sector_news = sector_news or {}
+
+        llm_reasons = self._build_llm_reasons(
+            entries,
+            news=news,
+            sector_news=per_sector_news,
+            catalyst_context=context,
+            language=language,
+        )
 
         for sector, direction in entries:
             name = _text(sector.get("name"))
@@ -128,9 +145,12 @@ class SectorDriverService:
             source = "llm" if reason else ""
             if not reason:
                 reason = self._clean_reason(
-                    self._build_factual_reason(sector, direction, language), language
+                    self._build_attribution_reason(
+                        context.get(name) or {}, direction, language
+                    ),
+                    language,
                 )
-                source = "board_internals" if reason else ""
+                source = "sub_sector_attribution" if reason else ""
 
             if not reason:
                 stats["empty"] += 1
@@ -138,85 +158,50 @@ class SectorDriverService:
 
             sector["reason"] = reason
             sector["reason_source"] = source
-            stats["llm" if source == "llm" else "factual"] += 1
+            stats["llm" if source == "llm" else "attribution"] += 1
 
         return stats
 
     # ------------------------------------------------------------------
-    # 事实层：板块内部结构
+    # 归因层：子板块 / 涨停股（不含涨跌幅复述）
     # ------------------------------------------------------------------
-    def _build_factual_reason(
+    def _build_attribution_reason(
         self,
-        sector: Dict[str, Any],
+        material: Dict[str, Any],
         direction: str,
         language: str,
     ) -> str:
-        """仅用板块榜单自带字段描述异动，无需额外请求。"""
+        """模型弃权时的兜底：指出行业内部是哪一块在带动，而不是复述涨跌幅。"""
         parts: List[str] = []
 
-        breadth = self._describe_breadth(
-            _to_int(sector.get("up_count")),
-            _to_int(sector.get("down_count")),
-            language,
-        )
-        if breadth:
-            parts.append(breadth)
+        subs = [s for s in (material.get("sub_sectors") or []) if isinstance(s, dict)]
+        if subs:
+            picked = subs[0] if direction == "up" else subs[-1]
+            sub_name = _text(picked.get("name"))
+            if sub_name:
+                if language == "en":
+                    verb = "led by" if direction == "up" else "dragged down by"
+                    parts.append(f"mainly {verb} {sub_name} ({_fmt_pct(picked.get('change_pct'))})")
+                else:
+                    verb = "带动" if direction == "up" else "拖累"
+                    parts.append(f"主要由{sub_name}({_fmt_pct(picked.get('change_pct'))}){verb}")
 
-        leader = self._describe_leader(
-            _text(sector.get("leader_stock")),
-            _to_float(sector.get("leader_change_pct")),
-            direction,
-            language,
-        )
-        if leader:
-            parts.append(leader)
-
-        return ("; " if language == "en" else "，").join(parts)
-
-    @staticmethod
-    def _describe_breadth(
-        up_count: Optional[int],
-        down_count: Optional[int],
-        language: str,
-    ) -> str:
-        if up_count is None or down_count is None:
-            return ""
-        total = up_count + down_count
-        if total <= 0:
-            return ""
-        up_ratio = up_count / total
-        if language == "en":
-            if up_ratio >= 0.8:
-                tone = "broad advance"
-            elif up_ratio <= 0.2:
-                tone = "broad decline"
+        limit_ups = [s for s in (material.get("limit_up_stocks") or []) if isinstance(s, dict)]
+        names = [_text(s.get("name")) for s in limit_ups if _text(s.get("name"))]
+        if names and direction == "up":
+            listed = "、".join(names[:3]) if language != "en" else ", ".join(names[:3])
+            if language == "en":
+                parts.append(f"{listed} hit the daily limit")
             else:
-                tone = "mixed"
-            return f"{up_count} up / {down_count} down, {tone}"
-        if up_ratio >= 0.8:
-            tone = "板块普涨"
-        elif up_ratio <= 0.2:
-            tone = "板块普跌"
-        else:
-            tone = "板块内分化"
-        return f"{up_count}涨{down_count}跌，{tone}"
+                parts.append(f"{listed}等涨停")
 
-    @staticmethod
-    def _describe_leader(
-        leader: str,
-        leader_change_pct: Optional[float],
-        direction: str,
-        language: str,
-    ) -> str:
-        if not leader:
+        if not parts:
             return ""
-        pct_text = "" if leader_change_pct is None else f" {leader_change_pct:+.2f}%"
+
+        joined = ("; " if language == "en" else "，").join(parts)
         if language == "en":
-            label = "led by" if direction == "up" else "best performer"
-            return f"{label} {leader}{pct_text}"
-        # 领跌榜里「领涨股票」只是板块内最强个股，措辞需区分，避免误读为板块上涨
-        label = "龙头" if direction == "up" else "板块内最强"
-        return f"{label}{leader}{pct_text}"
+            return f"{joined}; no clear news catalyst found"
+        return f"{joined}；未检索到明确消息催化"
 
     # ------------------------------------------------------------------
     # 解读层：LLM
@@ -226,19 +211,28 @@ class SectorDriverService:
         entries: List[Tuple[Dict[str, Any], str]],
         *,
         news: Optional[Sequence[Any]],
+        sector_news: Dict[str, Sequence[Any]],
+        catalyst_context: Dict[str, Dict[str, Any]],
         language: str,
     ) -> Dict[str, str]:
-        """返回 ``{板块名: 原因}``；不可用时返回空字典。"""
+        """返回 ``{行业名: 原因}``；不可用时返回空字典。"""
         if not self._llm_enabled():
             return {}
 
-        news_text = self._format_news(news, language)
-        if not news_text:
-            # 没有新闻就没有「为什么动」的依据，直接交给事实层，避免模型凭空编造
-            logger.info("[板块异动] action=llm_reason status=skipped reason=no_news")
+        has_sector_news = any(sector_news.get(_text(s.get("name"))) for s, _ in entries)
+        market_news_text = self._format_news(news, language, limit=self._MAX_MARKET_NEWS)
+        if not has_sector_news and not market_news_text:
+            # 没有任何新闻就没有「为什么动」的依据，交给归因层，避免模型凭空编造
+            logger.info("[行业异动] action=llm_reason status=skipped reason=no_news")
             return {}
 
-        prompt = self._build_prompt(entries, news_text, language)
+        prompt = self._build_prompt(
+            entries,
+            market_news_text=market_news_text,
+            sector_news=sector_news,
+            catalyst_context=catalyst_context,
+            language=language,
+        )
         try:
             response = self.analyzer.generate_text(
                 prompt,
@@ -246,16 +240,16 @@ class SectorDriverService:
                 temperature=self._LLM_TEMPERATURE,
             )
         except Exception as exc:  # pragma: no cover - generate_text 内部已兜底
-            logger.warning("[板块异动] action=llm_reason status=failed error=%s", exc)
+            logger.warning("[行业异动] action=llm_reason status=failed error=%s", exc)
             return {}
 
         if not response:
-            logger.info("[板块异动] action=llm_reason status=empty_response")
+            logger.info("[行业异动] action=llm_reason status=empty_response")
             return {}
 
         reasons = self._parse_reasons(response, [_text(s.get("name")) for s, _ in entries])
         logger.info(
-            "[板块异动] action=llm_reason status=success parsed=%d/%d",
+            "[行业异动] action=llm_reason status=success parsed=%d/%d",
             len(reasons),
             len(entries),
         )
@@ -274,67 +268,142 @@ class SectorDriverService:
     def _build_prompt(
         self,
         entries: List[Tuple[Dict[str, Any], str]],
-        news_text: str,
+        *,
+        market_news_text: str,
+        sector_news: Dict[str, Sequence[Any]],
+        catalyst_context: Dict[str, Dict[str, Any]],
         language: str,
     ) -> str:
-        clues = "\n".join(self._format_clue(sector, direction, language) for sector, direction in entries)
+        blocks = "\n\n".join(
+            self._format_sector_block(sector, direction, sector_news, catalyst_context, language)
+            for sector, direction in entries
+        )
         if language == "en":
             return (
-                "You are an equity market recap assistant. For each sector below, write one "
-                "line explaining why it led or lagged today.\n\n"
+                "You are an equity market recap analyst. For each industry below, write one line "
+                "explaining WHY it led or lagged today.\n\n"
                 "Output format (strict):\n"
-                "- One sector per line, exactly: Sector => Reason\n"
+                "- One industry per line, exactly: Industry => Reason\n"
                 "- Output only those lines. No tables, numbering, headings or commentary.\n\n"
                 "Content rules:\n"
-                f"- Keep each reason under {self.MAX_REASON_CHARS_EN} characters and name the driver "
-                "(policy, news, event, fund flow, leading stock). Do not restate the percentage change.\n"
-                "- Use only the sector clues and news below. Never invent events, companies, "
-                "policies or figures.\n"
-                "- If a sector has no supporting evidence, write: Sector => none\n\n"
-                f"[Sector clues]\n{clues}\n\n"
-                f"[Market news]\n{news_text}\n"
+                f"- Each reason must be under {self.MAX_REASON_CHARS_EN} characters and name the "
+                "actual catalyst: policy or regulation, company/industry news, overnight overseas "
+                "moves, fund rotation, or a leading stock.\n"
+                "- Do NOT simply restate the percentage change or advancer/decliner counts. "
+                "A reason that only describes how much it moved is unacceptable.\n"
+                "- You may cite the sub-industry that drove the move, and name specific stocks "
+                "that hit the daily limit or fell sharply, using only the material given.\n"
+                "- Use ONLY the material below. Never invent events, policies, figures or companies.\n"
+                "- If an industry has no supporting evidence, write: Industry => none\n\n"
+                f"[Industry material]\n{blocks}\n\n"
+                f"[Market-wide news]\n{market_news_text or 'none'}\n"
             )
         return (
-            "你是 A 股盘后复盘助手。请为下面每个板块写一条「异动原因」，解释它今天为什么领涨或领跌。\n\n"
+            "你是 A 股盘后复盘分析师。请为下面每个行业写一条「异动原因」，"
+            "说明它今天为什么领涨或领跌。\n\n"
             "输出格式（严格遵守）：\n"
-            "- 每行一个板块，格式为：板块名 => 原因\n"
+            "- 每行一个行业，格式为：行业名 => 原因\n"
             "- 只输出这些行，不要表格、序号、标题或额外说明\n\n"
             "内容要求：\n"
-            f"- 每条原因不超过 {self.MAX_REASON_CHARS} 个字，写驱动因素（政策、消息、事件、资金、龙头股），"
-            "不要重复涨跌幅数字\n"
-            "- 只能依据下面的【板块线索】和【市场新闻】，不得编造事件、公司、政策或数据\n"
-            "- 找不到依据的板块，原因写「无」\n\n"
-            f"【板块线索】\n{clues}\n\n"
-            f"【市场新闻】\n{news_text}\n"
+            f"- 每条原因不超过 {self.MAX_REASON_CHARS} 个字，必须写出真正的催化因素："
+            "政策或监管文件、公司或产业消息、隔夜外盘表现、资金轮动、龙头股带动\n"
+            "- 禁止只复述涨跌幅或涨跌家数。只说明「涨了多少 / 跌了多少」的原因视为不合格\n"
+            "- 可以指出是哪个子板块带动，并点名涨停或大跌的具体个股，但只能用下面给的材料\n"
+            "- 只能依据下面的【行业材料】和【市场新闻】，不得编造事件、政策、数据或公司\n"
+            "- 确实找不到依据的行业，写：行业名 => 无\n\n"
+            "示例（仅供参考文风与信息密度，不要照抄内容）：\n"
+            "传媒 => Meta Muse 爆火带动 AI 应用行情，叠加《文化产业发展\"十五五\"规划》政策利好，"
+            "新华文轩、智度股份等多股涨停\n"
+            "钢铁 => 行业长期\"强供给、弱需求\"格局未改，地产新开工偏弱，高炉减产慢于需求回落，"
+            "供需压力大\n\n"
+            f"【行业材料】\n{blocks}\n\n"
+            f"【市场新闻】\n{market_news_text or '暂无'}\n"
         )
 
-    def _format_clue(self, sector: Dict[str, Any], direction: str, language: str) -> str:
+    def _format_sector_block(
+        self,
+        sector: Dict[str, Any],
+        direction: str,
+        sector_news: Dict[str, Sequence[Any]],
+        catalyst_context: Dict[str, Dict[str, Any]],
+        language: str,
+    ) -> str:
         name = _text(sector.get("name")) or "-"
-        change_pct = _to_float(sector.get("change_pct"))
-        change_text = "N/A" if change_pct is None else f"{change_pct:+.2f}%"
-        if language == "en":
-            label = "Leading" if direction == "up" else "Lagging"
-        else:
-            label = "领涨" if direction == "up" else "领跌"
-        segments = [f"{label} {name} {change_text}"]
+        label = ("Leading" if direction == "up" else "Lagging") if language == "en" else (
+            "领涨" if direction == "up" else "领跌"
+        )
+        lines = [f"{label} {name} {_fmt_pct(sector.get('change_pct'))}"]
 
-        factual = self._build_factual_reason(sector, direction, language)
-        if factual:
-            segments.append(factual)
-        return ("; " if language == "en" else "；").join(segments)
+        material = catalyst_context.get(name) or {}
 
-    def _format_news(self, news: Optional[Sequence[Any]], language: str) -> str:
+        subs = [s for s in (material.get("sub_sectors") or []) if isinstance(s, dict)]
+        if subs:
+            text = "、".join(
+                f"{_text(s.get('name'))} {_fmt_pct(s.get('change_pct'))}"
+                for s in subs[: self._MAX_SUB_SECTORS]
+                if _text(s.get("name"))
+            )
+            if text:
+                lines.append(f"  {'sub-industries' if language == 'en' else '子板块'}: {text}")
+
+        limit_ups = [s for s in (material.get("limit_up_stocks") or []) if isinstance(s, dict)]
+        if limit_ups:
+            items = []
+            for s in limit_ups[: self._MAX_STOCK_EXAMPLES]:
+                stock_name = _text(s.get("name"))
+                if not stock_name:
+                    continue
+                sub = _text(s.get("sub_industry"))
+                streak = s.get("streak")
+                extra = "/".join(p for p in (sub, f"{streak}板" if streak else "") if p)
+                items.append(f"{stock_name}({extra})" if extra else stock_name)
+            if items:
+                key = "limit-up" if language == "en" else "涨停股"
+                lines.append(f"  {key}: {'、'.join(items)}")
+
+        for material_key, zh_key, en_key in (
+            ("top_gainers", "领涨个股", "top gainers"),
+            ("top_losers", "领跌个股", "top losers"),
+        ):
+            rows = [s for s in (material.get(material_key) or []) if isinstance(s, dict)]
+            if not rows:
+                continue
+            text = "、".join(
+                f"{_text(s.get('name'))} {_fmt_pct(s.get('change_pct'))}"
+                for s in rows[: self._MAX_STOCK_EXAMPLES]
+                if _text(s.get("name"))
+            )
+            if text:
+                lines.append(f"  {en_key if language == 'en' else zh_key}: {text}")
+
+        own_news = self._format_news(
+            sector_news.get(name), language, limit=self._MAX_SECTOR_NEWS, indent="    "
+        )
+        if own_news:
+            key = "related news" if language == "en" else "相关新闻"
+            lines.append(f"  {key}:\n{own_news}")
+
+        return "\n".join(lines)
+
+    def _format_news(
+        self,
+        news: Optional[Sequence[Any]],
+        language: str,
+        *,
+        limit: int,
+        indent: str = "",
+    ) -> str:
         lines: List[str] = []
-        for item in list(news or [])[: self._MAX_NEWS_ITEMS]:
+        for item in list(news or [])[:limit]:
             title = _shorten(_news_field(item, "title"), self._NEWS_TITLE_LIMIT)
             if not title:
                 continue
             source = _shorten(_news_field(item, "source"), 30)
             snippet = _shorten(_news_field(item, "snippet"), self._NEWS_SNIPPET_LIMIT)
-            head = f"{len(lines) + 1}. {title}"
+            head = f"{indent}{len(lines) + 1}. {title}"
             if source:
                 head += f" ({source})" if language == "en" else f"（{source}）"
-            lines.append(f"{head}\n   {snippet}" if snippet else head)
+            lines.append(f"{head}\n{indent}   {snippet}" if snippet else head)
         return "\n".join(lines)
 
     # ------------------------------------------------------------------
@@ -362,7 +431,7 @@ class SectorDriverService:
 
     @staticmethod
     def _match_sector_name(raw_name: str, known_names: Sequence[str]) -> str:
-        """把模型给出的板块名对回榜单里的板块名，歧义时放弃以免错配。"""
+        """把模型给出的行业名对回榜单里的行业名，歧义时放弃以免错配。"""
         candidate = _text(raw_name)
         if not candidate:
             return ""

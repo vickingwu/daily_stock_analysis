@@ -73,12 +73,34 @@ _SECTOR_INTERNAL_COLUMNS_EM = {
     'leader_stock': '领涨股票',
     'leader_change_pct': '领涨股票-涨跌幅',
 }
+_SECTOR_INTERNAL_COLUMNS_SW_L1 = {
+    'code': '指数代码',
+}
+
+
+def _safe_float_or_none(value: Any) -> Optional[float]:
+    try:
+        if value is None or pd.isna(value):
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_int_or_none(value: Any) -> Optional[int]:
+    try:
+        if value is None or pd.isna(value):
+            return None
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 _SECTOR_INTERNAL_COLUMNS_SINA = {
     'member_count': '公司家数',
     'leader_stock': '股票名称',
     'leader_change_pct': '个股-涨跌幅',
 }
 _SECTOR_INTERNAL_FIELD_TYPES = {
+    'code': str,
     'up_count': int,
     'down_count': int,
     'member_count': int,
@@ -1936,12 +1958,15 @@ class AkshareFetcher(BaseFetcher):
         获取行业板块涨跌榜
 
         数据源优先级：
-        1. 东财接口 (ak.stock_board_industry_name_em)
-        2. 新浪接口 (ak.stock_sector_spot)
+        1. 申万一级行业 (ak.index_realtime_sw) —— 31 个一级行业，粒度与券商复盘口径一致
+        2. 东财二级行业 (ak.stock_board_industry_name_em) —— 86 个细分板块，降级用
+        3. 新浪接口 (ak.stock_sector_spot)
 
-        每个板块除 name / change_pct 外，会按数据源可用情况附带板块内部结构字段
-        （up_count / down_count / member_count / leader_stock / leader_change_pct），
-        供大盘复盘生成板块异动原因；字段缺失时自动省略。
+        每个板块除 name / change_pct 外，会按数据源可用情况附带：
+        - taxonomy: 分类口径（sw_l1 / em_l2 / sina），下游据此决定能否做子板块归因
+        - code: 行业指数代码（仅申万口径，用于取成分股）
+        - 板块内部结构字段（up_count / down_count / member_count /
+          leader_stock / leader_change_pct），字段缺失时自动省略。
         """
         import akshare as ak
 
@@ -1951,6 +1976,7 @@ class AkshareFetcher(BaseFetcher):
             industry_name: str,
             n: int,
             extra_cols: Optional[Dict[str, str]] = None,
+            taxonomy: str = '',
         ) -> Tuple[list, list]:
             df[change_col] = pd.to_numeric(df[change_col], errors='coerce')
             df = df.dropna(subset=[change_col])
@@ -1958,13 +1984,13 @@ class AkshareFetcher(BaseFetcher):
             # 涨幅前n
             top = df.nlargest(n, change_col)
             top_sectors = [
-                _build_sector_item(row, industry_name, change_col, extra_cols)
+                _build_sector_item(row, industry_name, change_col, extra_cols, taxonomy)
                 for _, row in top.iterrows()
             ]
 
             bottom = df.nsmallest(n, change_col)
             bottom_sectors = [
-                _build_sector_item(row, industry_name, change_col, extra_cols)
+                _build_sector_item(row, industry_name, change_col, extra_cols, taxonomy)
                 for _, row in bottom.iterrows()
             ]
             return top_sectors, bottom_sectors
@@ -1974,8 +2000,11 @@ class AkshareFetcher(BaseFetcher):
             name_col: str,
             change_col: str,
             extra_cols: Optional[Dict[str, str]],
+            taxonomy: str = '',
         ) -> Dict[str, Any]:
             item: Dict[str, Any] = {'name': row[name_col], 'change_pct': row[change_col]}
+            if taxonomy:
+                item['taxonomy'] = taxonomy
             for out_key, src_col in (extra_cols or {}).items():
                 if src_col not in row.index:
                     continue
@@ -1994,7 +2023,37 @@ class AkshareFetcher(BaseFetcher):
                 item[out_key] = casted
             return item
 
-        # 优先东财接口
+        # 优先申万一级行业：31 个一级行业，与券商盘后复盘的行业口径一致
+        try:
+            self._set_random_user_agent()
+            self._enforce_rate_limit()
+
+            logger.info("[API调用] ak.index_realtime_sw('一级行业') 获取申万一级行业排行...")
+            df = ak.index_realtime_sw(symbol='一级行业')
+            if df is not None and not df.empty:
+                required = {'指数名称', '最新价', '昨收盘'}
+                if required.issubset(set(df.columns)):
+                    df = df.copy()
+                    for col in ('最新价', '昨收盘'):
+                        df[col] = pd.to_numeric(df[col], errors='coerce')
+                    df = df[df['昨收盘'] > 0]
+                    # 申万接口只给点位，不给涨跌幅，这里按 (最新价-昨收盘)/昨收盘 计算
+                    df['涨跌幅'] = (df['最新价'] - df['昨收盘']) / df['昨收盘'] * 100
+                    if not df.empty:
+                        return _get_rank_top_n(
+                            df, '涨跌幅', '指数名称', n,
+                            _SECTOR_INTERNAL_COLUMNS_SW_L1,
+                            taxonomy='sw_l1',
+                        )
+                logger.warning(
+                    "[Akshare] 申万一级行业接口缺少必要列 %s，降级到东财二级行业",
+                    sorted(required - set(df.columns)),
+                )
+
+        except Exception as e:
+            logger.warning(f"[Akshare] 申万一级行业排行获取失败: {e}，降级到东财二级行业")
+
+        # 申万失败后，降级到东财二级行业板块
         try:
             self._set_random_user_agent()
             self._enforce_rate_limit()
@@ -2004,7 +2063,9 @@ class AkshareFetcher(BaseFetcher):
             if df is not None and not df.empty:
                 change_col = '涨跌幅'
                 name = '板块名称'
-                return _get_rank_top_n(df, change_col, name, n, _SECTOR_INTERNAL_COLUMNS_EM)
+                return _get_rank_top_n(
+                    df, change_col, name, n, _SECTOR_INTERNAL_COLUMNS_EM, taxonomy='em_l2'
+                )
             
         except Exception as e:
             logger.warning(f"[Akshare] 东财接口获取行业板块排行失败: {e}，尝试新浪接口")
@@ -2020,11 +2081,211 @@ class AkshareFetcher(BaseFetcher):
                 return None
             change_col = '涨跌幅'
             name = '板块'
-            return _get_rank_top_n(df, change_col, name, n, _SECTOR_INTERNAL_COLUMNS_SINA)
+            return _get_rank_top_n(
+                df, change_col, name, n, _SECTOR_INTERNAL_COLUMNS_SINA, taxonomy='sina'
+            )
         
         except Exception as e:
             logger.error(f"[Akshare] 新浪接口获取板块排行也失败: {e}")
             return None
+
+    def _get_market_spot_cached(self) -> Optional[pd.DataFrame]:
+        """复用 A 股全量行情缓存（_realtime_cache）；缓存冷时拉一次，失败返回 None。"""
+        import akshare as ak
+
+        current_time = time.time()
+        if (_realtime_cache['data'] is not None
+                and current_time - _realtime_cache['timestamp'] < _realtime_cache['ttl']):
+            return _realtime_cache['data']
+
+        try:
+            self._set_random_user_agent()
+            self._enforce_rate_limit()
+            logger.info("[API调用] ak.stock_zh_a_spot_em() 获取全市场行情（板块归因用）...")
+            df = ak.stock_zh_a_spot_em()
+            if df is not None and not df.empty:
+                _realtime_cache['data'] = df
+                _realtime_cache['timestamp'] = current_time
+                return df
+        except Exception as e:
+            logger.warning(f"[Akshare] 东财全市场行情失败: {e}，尝试新浪接口")
+
+        # 东财全量接口容易被限流/断连，降级到新浪（列名不同，调用方按列存在性判断）
+        try:
+            self._set_random_user_agent()
+            self._enforce_rate_limit()
+            logger.info("[API调用] ak.stock_zh_a_spot() 获取全市场行情(新浪)...")
+            df = ak.stock_zh_a_spot()
+            if df is None or df.empty:
+                return None
+            return df
+        except Exception as e:
+            logger.warning(f"[Akshare] 全市场行情获取失败，跳过个股级归因: {e}")
+            return None
+
+    def _get_sw_level2_with_parent(self) -> Optional[pd.DataFrame]:
+        """申万二级行业实时涨跌幅 + 所属一级行业（用于子板块归因）。
+
+        归属关系取自 ak.sw_index_second_info() 的「上级行业」列，避免按代码前缀猜测
+        （申万二级代码存在历史不规则，前缀匹配会漏掉机械设备/汽车/计算机等约 22 个二级）。
+        """
+        import akshare as ak
+
+        try:
+            self._set_random_user_agent()
+            self._enforce_rate_limit()
+            logger.info("[API调用] ak.index_realtime_sw('二级行业') 获取申万二级行情...")
+            spot = ak.index_realtime_sw(symbol='二级行业')
+            if spot is None or spot.empty or '指数名称' not in spot.columns:
+                return None
+
+            self._enforce_rate_limit()
+            logger.info("[API调用] ak.sw_index_second_info() 获取二级->一级归属...")
+            info = ak.sw_index_second_info()
+            if info is None or info.empty or '上级行业' not in info.columns:
+                return None
+
+            spot = spot.copy()
+            for col in ('最新价', '昨收盘'):
+                if col not in spot.columns:
+                    return None
+                spot[col] = pd.to_numeric(spot[col], errors='coerce')
+            spot = spot[spot['昨收盘'] > 0]
+            spot['涨跌幅'] = (spot['最新价'] - spot['昨收盘']) / spot['昨收盘'] * 100
+
+            parent = info[['行业名称', '上级行业']].rename(columns={'行业名称': '指数名称'})
+            merged = spot.merge(parent, on='指数名称', how='inner')
+            return merged[['指数名称', '涨跌幅', '上级行业']].dropna()
+        except Exception as e:
+            logger.warning(f"[Akshare] 申万二级归属获取失败，跳过子板块归因: {e}")
+            return None
+
+    def get_sector_catalyst_context(
+        self,
+        sectors: List[Dict[str, Any]],
+        *,
+        date: Optional[str] = None,
+        max_examples: int = 4,
+    ) -> Dict[str, Dict[str, Any]]:
+        """为申万一级行业采集异动归因材料。
+
+        Args:
+            sectors: 目标行业列表，元素需含 name，申万口径还需 code / taxonomy='sw_l1'
+            date: 涨停池日期（YYYYMMDD），默认当日
+            max_examples: 每类个股示例数量上限
+
+        Returns:
+            Dict: ``{行业名: {sub_sectors_up, sub_sectors_down, limit_up_stocks,
+            top_gainers, top_losers}}``。任一材料获取失败只影响该项，其余照常返回；
+            全部失败返回空字典，不抛异常。
+        """
+        import akshare as ak
+
+        targets = [
+            s for s in (sectors or [])
+            if isinstance(s, dict) and str(s.get('name') or '').strip()
+        ]
+        if not targets:
+            return {}
+
+        result: Dict[str, Dict[str, Any]] = {
+            str(s['name']).strip(): {
+                'sub_sectors': [],
+                'limit_up_stocks': [], 'top_gainers': [], 'top_losers': [],
+            }
+            for s in targets
+        }
+
+        # --- 共享材料：子板块、涨停池、全市场行情（与行业数量无关，各取一次） ---
+        level2 = self._get_sw_level2_with_parent()
+        if level2 is not None and not level2.empty:
+            for name, bucket in result.items():
+                subs = level2[level2['上级行业'].astype(str) == name]
+                if subs.empty:
+                    continue
+                # 单一降序列表：子板块本身不多（多为 2-10 个），拆 up/down 会在数量少时
+                # 产出同一批数据的正反两份，反而给下游造成噪音
+                bucket['sub_sectors'] = [
+                    {'name': str(r['指数名称']), 'change_pct': float(r['涨跌幅'])}
+                    for _, r in subs.sort_values('涨跌幅', ascending=False).iterrows()
+                ]
+
+        zt_pool = None
+        try:
+            self._set_random_user_agent()
+            self._enforce_rate_limit()
+            zt_date = date or datetime.now().strftime('%Y%m%d')
+            logger.info(f"[API调用] ak.stock_zt_pool_em(date={zt_date}) 获取涨停池...")
+            zt_pool = ak.stock_zt_pool_em(date=zt_date)
+            if zt_pool is not None and not zt_pool.empty and '代码' in zt_pool.columns:
+                zt_pool = zt_pool.copy()
+                zt_pool['_code'] = zt_pool['代码'].astype(str).str.zfill(6)
+            else:
+                zt_pool = None
+        except Exception as e:
+            logger.warning(f"[Akshare] 涨停池获取失败，跳过涨停股印证: {e}")
+            zt_pool = None
+
+        spot = self._get_market_spot_cached()
+        if spot is not None and {'代码', '名称', '涨跌幅'}.issubset(set(spot.columns)):
+            spot = spot.copy()
+            # 东财返回裸 6 位代码，新浪返回带 sh/sz 前缀，统一成 6 位
+            spot['_code'] = (
+                spot['代码'].astype(str).str.replace(r'^[A-Za-z]+', '', regex=True).str.zfill(6)
+            )
+            spot['涨跌幅'] = pd.to_numeric(spot['涨跌幅'], errors='coerce')
+            spot = spot.dropna(subset=['涨跌幅'])
+        else:
+            spot = None
+
+        if zt_pool is None and spot is None:
+            return result
+
+        # --- 逐行业：成分股 -> 交叉涨停池与全市场行情 ---
+        for sector in targets:
+            name = str(sector['name']).strip()
+            code = str(sector.get('code') or '').strip()
+            if not code or sector.get('taxonomy') != 'sw_l1':
+                continue
+            try:
+                self._set_random_user_agent()
+                self._enforce_rate_limit()
+                cons = ak.index_component_sw(code)
+                if cons is None or cons.empty or '证券代码' not in cons.columns:
+                    continue
+                codes = set(cons['证券代码'].astype(str).str.zfill(6))
+            except Exception as e:
+                logger.warning(f"[Akshare] 行业 {name}({code}) 成分股获取失败: {e}")
+                continue
+
+            bucket = result[name]
+
+            if zt_pool is not None:
+                hit = zt_pool[zt_pool['_code'].isin(codes)]
+                bucket['limit_up_stocks'] = [
+                    {
+                        'name': str(r.get('名称', '')).strip(),
+                        'change_pct': _safe_float_or_none(r.get('涨跌幅')),
+                        'sub_industry': str(r.get('所属行业', '')).strip(),
+                        'streak': _safe_int_or_none(r.get('连板数')),
+                    }
+                    for _, r in hit.head(max_examples * 2).iterrows()
+                    if str(r.get('名称', '')).strip()
+                ][:max_examples]
+
+            if spot is not None:
+                sub = spot[spot['_code'].isin(codes)]
+                if not sub.empty:
+                    bucket['top_gainers'] = [
+                        {'name': str(r['名称']).strip(), 'change_pct': float(r['涨跌幅'])}
+                        for _, r in sub.nlargest(max_examples, '涨跌幅').iterrows()
+                    ]
+                    bucket['top_losers'] = [
+                        {'name': str(r['名称']).strip(), 'change_pct': float(r['涨跌幅'])}
+                        for _, r in sub.nsmallest(max_examples, '涨跌幅').iterrows()
+                    ]
+
+        return result
 
     def get_concept_rankings(self, n: int = 5) -> Optional[Tuple[List[Dict], List[Dict]]]:
         """获取概念/题材涨跌榜。"""

@@ -46,16 +46,15 @@ _CHINESE_SECTION_PATTERNS = {
     "news_catalysts": r"###\s*五、(?:消息催化|后市展望)",
 }
 
-# 板块涨跌榜表头（含异动原因列），(表头行, 分隔行)
+# 行业涨跌榜展示行数：对齐券商复盘口径，只列头部，避免长原因列把推送撑爆
+_SECTOR_TABLE_ROWS = 3
+
+# 行业涨跌榜表头（含异动原因列），(表头行, 分隔行)
 _SECTOR_TABLE_HEADERS = {
-    "en": (
-        "| Rank | Sector | Change | Driver |",
-        "|------|--------|--------|--------|",
-    ),
-    "zh": (
-        "| 排名 | 板块 | 涨跌幅 | 异动原因 |",
-        "|------|------|--------|----------|",
-    ),
+    ("en", "up"): ("| Industry | Change | Driver |", "|----------|--------|--------|"),
+    ("en", "down"): ("| Industry | Change | Driver |", "|----------|--------|--------|"),
+    ("zh", "up"): ("| 行业 | 涨幅 | 异动原因 |", "|------|------|----------|"),
+    ("zh", "down"): ("| 行业 | 跌幅 | 异动原因 |", "|------|------|----------|"),
 }
 
 
@@ -443,7 +442,7 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
         try:
             logger.info("[大盘] %s action=get_sector_rankings status=start", self._log_context())
 
-            top_sectors, bottom_sectors = self.data_manager.get_sector_rankings(5)
+            top_sectors, bottom_sectors = self.data_manager.get_sector_rankings(_SECTOR_TABLE_ROWS)
 
             if top_sectors or bottom_sectors:
                 overview.top_sectors = top_sectors
@@ -470,24 +469,77 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
 
         try:
             logger.info("[大盘] %s action=annotate_sector_reasons status=start", self._log_context())
+            sectors = list(overview.top_sectors or []) + list(overview.bottom_sectors or [])
             stats = SectorDriverService(config=self.config, analyzer=self.analyzer).annotate(
                 overview.top_sectors,
                 overview.bottom_sectors,
                 news=news,
+                sector_news=self._search_sector_news(sectors),
+                catalyst_context=self._get_sector_catalyst_context(sectors),
                 language=self._get_review_language(),
             )
             logger.info(
-                "[大盘] %s action=annotate_sector_reasons status=success total=%s llm=%s factual=%s empty=%s",
+                "[大盘] %s action=annotate_sector_reasons status=success "
+                "total=%s llm=%s attribution=%s empty=%s",
                 self._log_context(),
                 stats.get("total"),
                 stats.get("llm"),
-                stats.get("factual"),
+                stats.get("attribution"),
                 stats.get("empty"),
             )
         except Exception as e:
             logger.warning(
                 "[大盘] %s action=annotate_sector_reasons status=failed error=%s", self._log_context(), e
             )
+
+    def _search_sector_news(self, sectors: List[Dict]) -> Dict[str, List]:
+        """按行业逐个检索新闻。市场级查询覆盖不到单个行业，必须单独检索才有催化依据。"""
+        if not getattr(self, "search_service", None):
+            return {}
+        if getattr(self.config, "market_sector_news_search_enabled", True) is not True:
+            logger.info("[大盘] %s action=search_sector_news status=disabled", self._log_context())
+            return {}
+
+        max_results = max(1, int(getattr(self.config, "market_sector_news_max_results", 3) or 3))
+        result: Dict[str, List] = {}
+        for sector in sectors:
+            name = str((sector or {}).get("name") or "").strip()
+            if not name or name in result:
+                continue
+            try:
+                response = self.search_service.search_stock_news(
+                    stock_code="market",
+                    stock_name=f"{name}行业",
+                    max_results=max_results,
+                    focus_keywords=[name, "板块", "异动", "消息"],
+                )
+                if response and response.results:
+                    result[name] = list(response.results)
+            except Exception as exc:
+                logger.warning(
+                    "[大盘] %s action=search_sector_news status=failed sector=%s error=%s",
+                    self._log_context(), name, exc,
+                )
+
+        logger.info(
+            "[大盘] %s action=search_sector_news status=success sectors=%d hit=%d",
+            self._log_context(), len(sectors), len(result),
+        )
+        return result
+
+    def _get_sector_catalyst_context(self, sectors: List[Dict]) -> Dict[str, Dict]:
+        """取行业异动归因材料（子板块 / 涨停股 / 领涨领跌个股），失败返回空。"""
+        manager = getattr(self, "data_manager", None)
+        if manager is None or not hasattr(manager, "get_sector_catalyst_context"):
+            return {}
+        try:
+            return manager.get_sector_catalyst_context(sectors) or {}
+        except Exception as exc:
+            logger.warning(
+                "[大盘] %s action=get_sector_catalyst_context status=failed error=%s",
+                self._log_context(), exc,
+            )
+            return {}
     
     # def _get_north_flow(self, overview: MarketOverview):
     #     """获取北向资金流入"""
@@ -977,28 +1029,32 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
         """Build sector ranking block."""
         if not overview.top_sectors and not overview.bottom_sectors:
             return ""
-        language = self._get_review_language()
-        header, divider = _SECTOR_TABLE_HEADERS["en" if language == "en" else "zh"]
+        language = "en" if self._get_review_language() == "en" else "zh"
         lines = []
+        top_n = _SECTOR_TABLE_ROWS
         if overview.top_sectors:
-            lines.append("#### Leading Sectors" if language == "en" else "#### 领涨板块 Top 5")
-            lines.extend([header, divider])
+            lines.append(
+                "#### Leading Industries" if language == "en" else f"#### 领涨行业 Top {top_n}"
+            )
+            lines.extend(_SECTOR_TABLE_HEADERS[(language, "up")])
             lines.extend(self._build_sector_rows(overview.top_sectors))
         if overview.bottom_sectors:
             if lines:
                 lines.append("")
-            lines.append("#### Lagging Sectors" if language == "en" else "#### 领跌板块 Top 5")
-            lines.extend([header, divider])
+            lines.append(
+                "#### Lagging Industries" if language == "en" else f"#### 领跌行业 Top {top_n}"
+            )
+            lines.extend(_SECTOR_TABLE_HEADERS[(language, "down")])
             lines.extend(self._build_sector_rows(overview.bottom_sectors))
         return "\n".join(lines)
 
     @classmethod
     def _build_sector_rows(cls, sectors: List[Dict]) -> List[str]:
-        """Render sector table rows, including the driver (异动原因) column."""
+        """Render industry table rows, including the driver (异动原因) column."""
         return [
-            f"| {rank} | {sector.get('name', '-')} | {cls._format_signed_pct(sector.get('change_pct'))} "
+            f"| {sector.get('name', '-')} | {cls._format_signed_pct(sector.get('change_pct'))} "
             f"| {cls._format_sector_reason(sector.get('reason'))} |"
-            for rank, sector in enumerate(sectors[:5], 1)
+            for sector in sectors[:_SECTOR_TABLE_ROWS]
         ]
 
     @staticmethod

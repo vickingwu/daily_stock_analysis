@@ -395,11 +395,14 @@ daily_stock_analysis/
 > - 官方 quickstart 已文档化 `quotes.get(universes=["CN_Equity_A"])`，但线上 smoke test 进一步确认：`TICKFLOW_API_KEY` 不等于一定具备该权限，且 `quotes.get(symbols=[...])` 单次存在标的数量限制。
 > - TickFlow 实际返回的 `change_pct` / `amplitude` 为比例值；系统已在接入层统一转换为百分比值，确保与现有数据源字段语义一致。
 > - A 股大盘复盘报告采用盘后工作台式结构：固定包含盘面信号、指数明细、板块 Top 表、近三日市场线索、明日交易计划和风险提示；盘面信号以 `66/100（偏暖，可进攻）` 这类纯文本分数表达，避免色块进度条在不同终端显示不一致；近三日市场线索只列标题、来源和链接，不再展示搜索摘要片段；若部分数据源缺失，则保留可用区块并在对应位置降级展示。
-> - 板块 Top 表（领涨板块 / 领跌板块）为 4 列：`排名 | 板块 | 涨跌幅 | 异动原因`。异动原因按两层降级取值，取不到时显示 `-`，长度上限约 30 字并自动转义 `|`：
->   1. 解读层（`MARKET_SECTOR_REASON_ENABLED=true` 且已配置模型、当日检索到新闻时）：用一次小额 LLM 调用，把当日市场新闻与板块线索归纳成一句驱动因素，例如「发改委部署能源保供，长协价机制优化」；模型给不出依据的板块会明确留空并降级；
->   2. 事实层：仅使用板块榜单接口自带的板块内部结构，不额外请求接口，例如「35涨0跌，板块普涨，龙头云煤能源 +10.12%」；领跌榜措辞为「板块内最强 xxx」，避免把板块内最强个股误读为板块上涨。
->   - 板块内部结构字段来源：东财 `stock_board_industry_name_em` 提供 `上涨家数` / `下跌家数` / `领涨股票` / `领涨股票-涨跌幅`；新浪备用源 `stock_sector_spot` 只提供 `公司家数` / `股票名称` / `个股-涨跌幅`，缺列时对应字段省略。
->   - 结构化载荷 `market_review_payload.sectors.{top,bottom}[]` 相应新增可选字段 `reason` 与 `reason_source`（`llm` / `board_internals`），`name` / `change_pct` 契约不变，仅追加字段。
+> - 行业 Top 表分「领涨行业 Top 3」与「领跌行业 Top 3」，各 3 列：`行业 | 涨幅(跌幅) | 异动原因`。
+>   - **行业口径为申万一级行业（31 个）**，与券商盘后复盘一致（传媒、计算机、家用电器、交通运输、钢铁、建筑材料…）。数据源优先级：申万一级 `index_realtime_sw('一级行业')` → 东财二级行业 `stock_board_industry_name_em`（86 个细分板块）→ 新浪 `stock_sector_spot`。申万接口只返回点位，涨跌幅按 `(最新价-昨收盘)/昨收盘` 计算；降级到东财时行业会变细（如「珠宝首饰」），属预期行为。
+>   - 异动原因按两层降级取值，取不到时显示 `-`，长度上限 120 字（英文报告 240）并自动转义 `|`：
+>     1. **解读层**（`MARKET_SECTOR_REASON_ENABLED=true`、已配置模型、且检索到新闻时）：一次 LLM 调用，把按行业检索的新闻与行业结构材料归纳成催化说明，例如「发改委部署能源保供叠加长协价机制优化，焦炭Ⅱ子板块领涨，港口库存降至近三年低位」。Prompt 明确禁止只复述涨跌幅或涨跌家数，并要求无依据时弃权。
+>     2. **归因层**：模型弃权或不可用时，只做子板块归因，例如「主要由玻璃玻纤(-3.18%)拖累；未检索到明确消息催化」。这与券商复盘里「主要是航运港口板块走弱」同类，属于对「为什么」的回答；不使用涨跌家数、龙头股涨跌幅这类与原因无关的描述。
+>   - 催化材料来源（申万口径下才采集，全部 fail-open）：申万二级子板块涨跌（归属取 `sw_index_second_info()` 的「上级行业」列，不按代码前缀猜测）、涨停池 `stock_zt_pool_em` 交叉行业成分股 `index_component_sw` 得到的涨停个股（含连板数与子行业）、全市场行情交叉成分股得到的领涨/领跌个股。全市场行情复用已有 20 分钟缓存，东财失败时降级新浪。
+>   - 按行业检索新闻由 `MARKET_SECTOR_NEWS_SEARCH_ENABLED` 控制（默认开启），每个展示的行业消耗一次搜索调用（默认 3+3=6 次）；市场级查询覆盖不到单个行业，关闭后原因通常只剩归因层。
+>   - 结构化载荷 `market_review_payload.sectors.{top,bottom}[]` 相应新增可选字段 `reason`、`reason_source`（`llm` / `sub_sector_attribution`）、`taxonomy`（`sw_l1` / `em_l2` / `sina`）与 `code`，`name` / `change_pct` 契约不变，仅追加字段。
 > - 字段契约：
 >   - `fundamental_context.belong_boards` = 个股关联板块列表；A 股从 AkShare 板块名单写入，美股/港股从 yfinance `info.sector` / `info.industry` 写入，无数据时为 `[]`；
 >   - `fundamental_context.boards.data` = `sector_rankings`（板块涨跌榜，结构 `{top, bottom}`，HK/US 当前不提供）；
@@ -425,7 +428,9 @@ daily_stock_analysis/
 | `MAX_WORKERS` | 并发线程数 | `3` |
 | `MARKET_REVIEW_ENABLED` | 启用大盘复盘 | `true` |
 | `DAILY_MARKET_CONTEXT_ENABLED` | 将当日大盘环境摘要注入个股分析 Prompt，并在高风险/退潮环境下软化激进买入建议；默认开启，设为 `false` 后仍可运行大盘复盘 | `true` |
-| `MARKET_SECTOR_REASON_ENABLED` | 板块 Top 表「异动原因」是否调用大模型结合当日新闻解读（每次复盘额外一次小额 LLM 调用）；设为 `false` 后仍展示异动原因，但只用板块内部结构（涨跌家数、领涨个股）生成 | `true` |
+| `MARKET_SECTOR_REASON_ENABLED` | 行业 Top 表「异动原因」是否调用大模型解读催化事件（每次复盘一次 LLM 调用）；设为 `false` 后仍展示异动原因，但只做子板块归因 | `true` |
+| `MARKET_SECTOR_NEWS_SEARCH_ENABLED` | 是否按行业逐个检索新闻。催化依据的主要来源，每个展示的行业消耗一次搜索调用（默认 6 次）；关闭后异动原因通常只剩子板块归因 | `true` |
+| `MARKET_SECTOR_NEWS_MAX_RESULTS` | 每个行业检索的新闻条数（1-10） | `3` |
 | `MARKET_REVIEW_REGION` | 大盘复盘市场区域：cn(A股)、hk(港股)、us(美股)、both(三市场)，us 适合仅关注美股的用户 | `cn` |
 | `MARKET_REVIEW_COLOR_SCHEME` | 大盘复盘指数涨跌颜色：`green_up`=绿涨红跌（默认），`red_up`=红涨绿跌 | `green_up` |
 | `TRADING_DAY_CHECK_ENABLED` | 交易日检查：默认 `true`，非交易日跳过执行；设为 `false` 或使用 `--force-run` 可强制执行（Issue #373） | `true` |
