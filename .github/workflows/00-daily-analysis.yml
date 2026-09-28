@@ -391,7 +391,13 @@ jobs:
           fi
 
           # 判断运行模式
-          MODE="${{ github.event.inputs.mode || 'full' }}"
+          # 定时触发只跑大盘复盘：每日邮件只需要全市场情况，不需要逐个自选股报告。
+          # 手动触发仍按 workflow_dispatch 的 mode 输入执行（full / market-only / stocks-only）。
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            MODE="market-only"
+          else
+            MODE="${{ github.event.inputs.mode || 'full' }}"
+          fi
           
           echo "=========================================="
           echo "🚀 A股自选股智能分析系统"
