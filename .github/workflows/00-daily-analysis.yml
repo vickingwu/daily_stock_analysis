@@ -61,43 +61,7 @@ jobs:
         run: |
           mkdir -p data logs reports
       
-      # 精确定时由 cron-job.org 通过 workflow_dispatch 触发（北京 15:35）。
-      # GitHub 的 schedule 事件实测延迟 4-7 小时，只能当「cron-job.org 挂了」时的兜底。
-      # 这里判断当日是否已有运行，避免两条链路在同一天推送两份报告。
-      - name: 今日已有运行则跳过（cron-job.org 触发优先）
-        id: dedupe
-        if: github.event_name == 'schedule'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RUN_ID: ${{ github.run_id }}
-          REPO: ${{ github.repository }}
-        run: |
-          TODAY=$(TZ='Asia/Shanghai' date '+%Y-%m-%d')
-          # 同时计入「已成功」与「正在跑/排队中」：cron-job.org 触发的运行可能还没跑完，
-          # 此时兜底若照跑就会重复。失败的运行不计入，否则失败当天连兜底一起被吞掉。
-          COUNT=$(gh api "/repos/$REPO/actions/workflows/00-daily-analysis.yml/runs?per_page=50" 2>/dev/null \
-            | jq --arg today "$TODAY" --argjson rid "$RUN_ID" '
-                [.workflow_runs[]
-                 | select(.id != $rid)
-                 | select((((.created_at|fromdateiso8601)+28800)|strftime("%Y-%m-%d")) == $today)
-                 | select(.conclusion == "success" or .status == "in_progress" or .status == "queued")]
-                | length') || COUNT=""
-          if [ -z "$COUNT" ]; then
-            # 查询失败时按「今日未运行」处理：宁可多发一份，也不能让兜底被误跳过
-            echo "⚠️ 查询历史运行失败，按今日未运行处理"
-            COUNT=0
-          fi
-          echo "📅 北京日期 $TODAY 当日已有运行数: $COUNT"
-          if [ "$COUNT" -gt 0 ]; then
-            echo "⏭️ 今日已有报告（通常来自 cron-job.org 15:35 触发），跳过本次兜底"
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "▶️ 今日尚无报告，执行兜底运行"
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: 执行股票分析
-        if: steps.dedupe.outputs.skip != 'true'
         env:
           # ==========================================
           # AI 配置
@@ -527,7 +491,7 @@ jobs:
       
       - name: 上传分析报告
         uses: actions/upload-artifact@v6
-        if: always() && steps.dedupe.outputs.skip != 'true'
+        if: always()
         with:
           name: analysis-reports-${{ github.run_number }}
           path: |
@@ -536,7 +500,7 @@ jobs:
           retention-days: 30
       
       - name: 显示运行结果
-        if: always() && steps.dedupe.outputs.skip != 'true'
+        if: always()
         run: |
           echo ""
           echo "=========================================="
